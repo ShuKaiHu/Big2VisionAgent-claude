@@ -1,0 +1,27 @@
+[project]
+name = "big2-vision-agent"
+version = "0.1.0"
+description = "Browser automation scaffold for Gamesofa Big2."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "playwright>=1.55.0",
+  "pydantic>=2.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4.0",
+  "pytest-asyncio>=1.2.0",
+]
+
+[project.scripts]
+big2-agent = "big2_vision_agent.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

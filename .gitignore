@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+playwright/.cache/
+artifacts/
+state/
+.DS_Store
+
+# --- Claude Code local settings ---
+.claude/
