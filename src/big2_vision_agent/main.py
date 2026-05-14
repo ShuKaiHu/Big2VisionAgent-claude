@@ -371,6 +371,45 @@ async def safe_read_current_scene(page) -> str | None:
         return None
 
 
+async def classify_page_stage(page) -> str:
+    """
+    Return a human-readable stage string that combines Cocos scene detection
+    with URL-pattern fallback.  The main loop uses this everywhere instead of
+    bare ``safe_read_current_scene`` so it always knows where it is.
+
+    Return values
+    -------------
+    "GameScene"        Cocos game in progress
+    "LobbyScene"       Cocos lobby (matchmaking / settings)
+    "<OtherScene>"     Any other Cocos scene name
+    "GameCanvas"       Game-canvas URL loaded but Cocos not yet initialised
+    "GamesofaHome"     Gamesofa website main page (no canvas yet)
+    "GamesofaLogin"    Gamesofa login page  (?op=login_all)
+    "FacebookConsent"  Facebook OAuth / GDPR consent popup
+    "Unknown"          None of the above
+    """
+    # Priority 1: Cocos scene (most specific; only available inside the canvas)
+    cocos_scene = await safe_read_current_scene(page)
+    if cocos_scene:
+        return cocos_scene
+
+    # Priority 2: URL-based classification (canvas not ready yet)
+    try:
+        url = page.url
+    except Exception:
+        return "Unknown"
+
+    if "facebook.com" in url:
+        return "FacebookConsent"
+    if "gamesofa.com/bigtwo/html5" in url or "lobby.php" in url:
+        return "GameCanvas"          # canvas page loaded, waiting for Cocos
+    if "op=login_all" in url:
+        return "GamesofaLogin"
+    if "gamesofa.com/bigtwo" in url or "gamesofa.com" in url:
+        return "GamesofaHome"
+    return "Unknown"
+
+
 def resolve_active_page(page):
     try:
         if not page.is_closed():
@@ -1716,8 +1755,8 @@ async def run_autoplay_random(settings: Settings, timeout_seconds: int, record_v
         last_hand_count = None
         last_polled_state: dict | None = None
 
-        scene = await safe_read_current_scene(page)
-        logger.log(f"Initial scene={scene}")
+        scene = await classify_page_stage(page)
+        logger.log(f"Initial stage={scene}")
         if scene != "GameScene":
             lobby_scene = await wait_for_scene(page, "LobbyScene", timeout_ms=30000)
             logger.log(f"wait_for_scene(LobbyScene) -> {lobby_scene}")
@@ -1954,13 +1993,16 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             logger = RunLogger(output_dir / "run.log")
             action_log: list[dict[str, object]] = []
 
-            scene = await safe_read_current_scene(page)
-            if scene in {None, "LoginScene"}:
+            scene = await classify_page_stage(page)
+            if scene not in ("GameScene", "LobbyScene"):
+                # Not in Cocos yet — wait up to 8 s for the canvas to initialise
                 settled_scene = await wait_for_game_scene(page, timeout_seconds=8)
                 if settled_scene is not None:
                     scene = settled_scene
+                else:
+                    scene = await classify_page_stage(page)
                 page = resolve_active_page(page)
-            logger.log(f"Initial scene={scene}")
+            logger.log(f"Initial stage={scene}")
             if scene != "GameScene":
                 page, scene = await ensure_game_scene_from_lobby(page, logger, attempts=3)
 
@@ -2019,9 +2061,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
 
             while loop.time() < hard_deadline:
                 page = resolve_active_page(page)
-                scene = await safe_read_current_scene(page)
-                # In GameScene the popup-clear clicks hit the card area and
-                # cause ghost card lifts; only run this outside GameScene.
+                scene = await classify_page_stage(page)
+                # Only attempt popup-clear when we are not in the game canvas
+                # (popup clicks at game-canvas coordinates cause ghost card lifts).
                 if scene != "GameScene":
                     await maybe_clear_lobby_popup(page)
 
@@ -2042,13 +2084,19 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 if scene != "GameScene":
                     if scene == "LobbyScene" and games_played < games_to_play:
                         page, scene = await ensure_game_scene_from_lobby(page, logger, attempts=2)
+                    elif scene not in ("LobbyScene", "GameCanvas"):
+                        # Unexpected stage — log so the user can see where we are
+                        logger.log(f"Waiting for game canvas (stage={scene}, url={page.url!r})")
                     await page.wait_for_timeout(IDLE_POLL_MS)
                     continue
 
                 state = await read_big2_game_state(page)
 
-                # Update game-started flag
-                if state.get("my_hand_count", 0) > 0:
+                # Update game-started flag.
+                # Require >= 5 cards to avoid false positives from transient
+                # state reads when reconnecting to a session mid-game or just
+                # after a game ended (stale state can briefly show 1-2 cards).
+                if state.get("my_hand_count", 0) >= 5:
                     game_has_started = True
 
                 # Primary stop condition: any player empties their hand
