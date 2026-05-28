@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from big2_vision_agent.agent_schema import AgentActionOption, AgentDecision
-from big2_vision_agent.browser.actions import click_design_point, read_big2_game_state, toggle_my_card_by_sprite, ws_send_raw
+from big2_vision_agent.browser.actions import click_design_point, deselect_all_selected_cards, read_big2_game_state, toggle_my_card_by_sprite, ws_send_raw
 
 WS_SEND_TARGET_CODE = "9"
 
@@ -11,6 +11,7 @@ COMBO_BUTTON_KEYS = {
     "straight": "straight",
     "full_house": "full_house",
     "four_of_a_kind": "four_kind",
+    "four_of_kind": "four_kind",   # wrapper returns this spelling
     "straight_flush": "straight_flush",
 }
 
@@ -36,26 +37,23 @@ async def _clear_selected_cards(page, state: dict) -> dict:
     if state.get("my_selected_count", 0) <= 0:
         return state
 
-    cancel_button = state.get("action_buttons", {}).get("cancel", {})
+    # Primary path: call setSelect(false) on all selected cards via Cocos API.
+    # This is the only reliable deselection path — toggle_my_card_by_sprite
+    # calls setSelect(true) and cannot deselect; pixel clicks are unreliable on
+    # overlapping cards (~70% overlap).
+    await deselect_all_selected_cards(page)
+    refreshed = await read_big2_game_state(page)
+    if refreshed.get("my_selected_count", 0) == 0:
+        return refreshed
+
+    # Fallback: cancel button if Cocos API deselect didn't fully clear.
+    cancel_button = refreshed.get("action_buttons", {}).get("cancel", {})
     center = cancel_button.get("center")
     if cancel_button.get("active") and center:
         await click_design_point(page, center["x"], center["y"])
         refreshed = await read_big2_game_state(page)
-        if refreshed.get("my_selected_count", 0) == 0:
-            return refreshed
-        state = refreshed
 
-    for index, card in enumerate(state.get("my_cards", [])):
-        if not card.get("selected"):
-            continue
-        points = _card_click_points(state.get("my_cards", []), index)
-        click_point = points[0] if points else card.get("center")
-        if not click_point:
-            continue
-        await click_design_point(page, click_point["x"], click_point["y"])
-        state = await read_big2_game_state(page)
-
-    return state
+    return refreshed
 
 
 def _selected_card_codes(state: dict) -> list[str]:

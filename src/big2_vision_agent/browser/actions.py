@@ -488,6 +488,62 @@ async def toggle_my_card_by_sprite(page: Page, sprite_frame: str) -> dict:
     )
 
 
+async def deselect_all_selected_cards(page) -> dict:
+    """Call setSelect(false) on every currently-selected card via Cocos API.
+
+    This is the reliable path for clearing stale selections — unlike pixel clicks
+    it is not confused by overlapping cards, and unlike toggle_my_card_by_sprite
+    (which always calls setSelect(true)) it actually deselects.
+    """
+    return await page.evaluate(
+        """
+        () => {
+          const ccGlobal = window.cc;
+          const scene = ccGlobal && ccGlobal.director && ccGlobal.director.getScene
+            ? ccGlobal.director.getScene()
+            : null;
+          if (!scene) return { ok: false, reason: 'no_scene', deselected: [] };
+
+          function byName(node, name) {
+            return (node && Array.isArray(node.children) ? node.children : [])
+              .find((child) => child.name === name) || null;
+          }
+
+          function pathNode(path) {
+            let node = scene;
+            for (const name of path) {
+              node = byName(node, name);
+              if (!node) return null;
+            }
+            return node;
+          }
+
+          function isSelected(cardNode) {
+            const frame = byName(cardNode, 'SelectFrame');
+            return Boolean(frame && frame.activeInHierarchy);
+          }
+
+          const wall = pathNode(['GameScene', 'GameLayer', 'CardLayer', 'MyCardWallLayer']);
+          if (!wall) return { ok: false, reason: 'no_wall', deselected: [] };
+
+          const deselected = [];
+          for (const child of wall.children || []) {
+            if (child.name !== 'Card' || !child.activeInHierarchy) continue;
+            if (!isSelected(child)) continue;
+            const cardComponent = child.getComponent && child.getComponent('Card');
+            if (cardComponent && typeof cardComponent.setSelect === 'function') {
+              try {
+                cardComponent.setSelect(false);
+                deselected.push(child.name);
+              } catch (e) {}
+            }
+          }
+          return { ok: true, deselected };
+        }
+        """
+    )
+
+
 async def inspect_my_card_by_sprite(page: Page, sprite_frame: str) -> dict:
     return await page.evaluate(
         """

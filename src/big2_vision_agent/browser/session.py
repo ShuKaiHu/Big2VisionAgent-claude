@@ -203,12 +203,23 @@ class BrowserSession:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self.context is not None:
-            await self.context.close()
-        if self._browser is not None:
-            await self._browser.close()
-        if self._playwright is not None:
-            await self._playwright.stop()
+        # Ctrl+C 或其他中斷可能導致瀏覽器連線已關閉，
+        # 清理時忽略 Exception（TargetClosedError / ConnectionClosed 等）。
+        try:
+            if self.context is not None:
+                await self.context.close()
+        except Exception:
+            pass
+        try:
+            if self._browser is not None:
+                await self._browser.close()
+        except Exception:
+            pass
+        try:
+            if self._playwright is not None:
+                await self._playwright.stop()
+        except Exception:
+            pass
 
     async def new_page(self) -> Page:
         if self.context is None:
