@@ -416,58 +416,51 @@ def _to_decision(action_idx: int) -> dict:
     return {"action": "play", "card_codes": codes, "combo_type": combo}
 
 
-# ── Forced-play rule ──────────────────────────────────────────────────────────
+# ── One-card rule: restrict singles when any opponent has 1 card ──────────────
 
-def _forced_highest_single(obs: dict) -> int | None:
-    """Return the action index of the highest legal single when the forced-play
-    rule applies, or None if the rule does not apply.
+def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray) -> np.ndarray:
+    """Filter obs_mask to enforce the house rule:
 
-    Rule (神來也大老二 house rule):
-      If the next player has exactly 1 card remaining AND the current board
-      requires singles (last played was a single, i.e. we are not free to
-      choose a combo type), we MUST play our absolute highest single.
+    When ANY opponent has exactly 1 card remaining, playing a single is
+    restricted to the HIGHEST single in the legal actions only.
+    Non-single plays (pair, 5-card combo, pass) are completely unrestricted.
 
-    We detect "next player" conservatively: if ANY opponent has 1 card, treat
-    the rule as active.  This is safe because:
-      - Playing your highest single is always at least as good as any other.
-      - The game server will reject the play if the rule is violated.
+    This applies whether we are the lead actor OR following someone else's
+    single — the old _forced_highest_single only handled the follower case.
+
+    Returns a (possibly modified) copy of obs_mask.
     """
-    c = obs.get("constraint", {})
-    last_played = c.get("last_played_cards", [])
-    lead_actor   = c.get("lead_actor")      # None when someone else leads
-
-    # The rule only fires when the board has a single up (len==1)
-    # AND we are not the lead actor (i.e., we don't get a free pick of combo).
-    if lead_actor is not None:
-        return None   # We have free control — choose any combo type freely
-    if len(last_played) != 1:
-        return None   # Board is not a single (pair, 5-card, or empty)
-
-    # Check if any opponent has exactly 1 card
     opponents = obs.get("opponents", [])
     if not any(opp.get("remaining_count") == 1 for opp in opponents):
-        return None
+        return obs_mask   # Rule inactive
 
-    # Find the highest single among legal actions (all are already ≥ table card)
-    legal_actions = obs.get("legal_actions", [])
-    single_plays = [
-        a for a in legal_actions
-        if a.get("action") == "play" and len(a.get("cards", [])) == 1
-    ]
-    if not single_plays:
-        return None   # No single that beats the table → we must pass
+    # Collect all single-card action indices that are currently legal
+    legal_singles: list[tuple[int, int]] = []   # (card_id, action_idx)
+    for action in obs.get("legal_actions", []):
+        if action.get("action") == "play" and len(action.get("cards", [])) == 1:
+            card_id = _bv_to_id(action["cards"][0]["code"])
+            try:
+                idx = enumerateOptions.SINGLE_INDEX[card_id]
+                if obs_mask[idx] > 0:
+                    legal_singles.append((card_id, idx))
+            except KeyError:
+                pass
 
-    best_action = max(single_plays, key=lambda a: _bv_to_id(a["cards"][0]["code"]))
-    best_code   = best_action["cards"][0]["code"]
-    best_id     = _bv_to_id(best_code)
+    if len(legal_singles) <= 1:
+        return obs_mask   # 0 or 1 singles — nothing to restrict
 
-    try:
-        forced_idx = enumerateOptions.SINGLE_INDEX[best_id]
-        log.info("Forced highest single (opponent has 1 card): %s", best_code)
-        return forced_idx
-    except KeyError:
-        log.warning("Could not map forced single %s to action index", best_code)
-        return None
+    # Keep only the highest single; zero-out all others
+    highest_id, _ = max(legal_singles, key=lambda x: x[0])
+    new_mask = obs_mask.copy()
+    for card_id, idx in legal_singles:
+        if card_id != highest_id:
+            new_mask[idx] = 0.0
+            log.debug("One-card rule: removed single card_id=%d from mask", card_id)
+
+    highest_code = _id_to_bv(highest_id)
+    log.info("One-card rule active: only highest single %s (+ multi-card combos) allowed",
+             highest_code)
+    return new_mask
 
 
 # ── Inference (MCTS + determinization) ───────────────────────────────────────
@@ -495,11 +488,11 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str]:
             obs_mask[enumerateOptions.passInd] = 1.0
             legal = np.array([enumerateOptions.passInd])
 
-    # ── Forced-play rule (house rule: must play highest single if next player
-    # has 1 card and board requires a single) ──────────────────────────────
-    forced = _forced_highest_single(obs)
-    if forced is not None:
-        return forced, "forced_highest_single"
+    # ── One-card rule: when any opponent has 1 card, only highest single legal ─
+    # Applies to both lead and follower situations. Must run BEFORE early-exit
+    # so the pass-only check sees the filtered mask.
+    obs_mask = _apply_one_card_rule(obs, obs_mask)
+    legal = np.flatnonzero(obs_mask)   # recompute after filter
 
     # ── Early exit: if the only legal action is pass, no need for MCTS ────
     # This is common when we can't beat the current table hand.
