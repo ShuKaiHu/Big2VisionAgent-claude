@@ -268,9 +268,11 @@ async def execute_agent_decision(
         and isinstance(after_count, int)
         and after_count < before_count
     )
-    # Retry verification once if neither hand nor turn appears to have changed yet.
-    if not hand_decreased and not turn_left_self:
-        await page.wait_for_timeout(800)
+    # Retry up to 2 more times before giving up (server can take ~3 s to respond).
+    for _extra_wait in (800, 1500):
+        if hand_decreased or turn_left_self:
+            break
+        await page.wait_for_timeout(_extra_wait)
         after_play = await read_big2_game_state(page)
         after_count = after_play.get("my_hand_count")
         turn_left_self = after_play.get("turn") != "self"
@@ -365,8 +367,14 @@ async def execute_packet_decision(
         and isinstance(after_count, int)
         and after_count < before_count
     )
-    if not hand_decreased and not turn_left_self:
-        await page.wait_for_timeout(800)
+    # Retry up to 2 more times (800 ms each) before giving up.
+    # The game server can silently hold a request for up to ~3 s before either
+    # confirming or sending self_play_request_unconfirmed + self_pass_request.
+    # Giving up after 1.6 s causes unnecessary play_not_confirmed errors.
+    for _extra_wait in (800, 1500):
+        if hand_decreased or turn_left_self:
+            break
+        await page.wait_for_timeout(_extra_wait)
         after = await read_big2_game_state(page)
         after_count = after.get("my_hand_count")
         turn_left_self = after.get("turn") != "self"
