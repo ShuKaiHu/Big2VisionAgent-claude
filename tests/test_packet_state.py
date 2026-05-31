@@ -137,6 +137,8 @@ def test_build_agent_observation_supports_dragon():
 
 
 def test_build_live_agent_observation_normalizes_self_lead_constraint():
+    """After all 3 opponents pass (passes_since_last_play==3), the constraint
+    should be cleared so we can freely lead the next trick."""
     timeline = [
         {"event": "self_hand_snapshot", "seq": 1, "cards": ["26", "47", "27", "48", "2T", "1J"]},
         {
@@ -146,10 +148,14 @@ def test_build_live_agent_observation_normalizes_self_lead_constraint():
             "combo": {"type": "single"},
             "decoded_cards": [{"code": "11", "display": "SA", "rank_label": "A", "suit_label": "S"}],
         },
+        {"event": "player_pass", "seq": 3, "actor": "right"},
+        {"event": "player_pass", "seq": 4, "actor": "top"},
+        {"event": "player_pass", "seq": 5, "actor": "left"},
     ]
+    # After all 3 opponents pass, Cocos no longer shows a required type
     runtime_state = {
         "turn": "self",
-        "current_required_type": "single",
+        "current_required_type": None,
         "my_cards": [
             {"sprite_frame": "c26"},
             {"sprite_frame": "c47"},
@@ -170,6 +176,49 @@ def test_build_live_agent_observation_normalizes_self_lead_constraint():
     assert observation.constraint.last_played_by is None
     assert observation.constraint.last_played_cards == []
     assert any(action.action == "play" for action in observation.legal_actions)
+
+
+def test_build_live_agent_observation_no_premature_lead_after_auto_play():
+    """When Cocos prematurely shows turn='self' after we auto-played but before
+    opponents have responded (passes_since_last_play < 3), the constraint must
+    NOT be cleared — legal_actions should be pass-only to prevent playing into
+    an unresolved trick."""
+    timeline = [
+        {"event": "self_hand_snapshot", "seq": 1, "cards": ["26", "47", "27", "48", "2T", "1J"]},
+        {
+            "event": "player_play",
+            "seq": 2,
+            "actor": "self",
+            "combo": {"type": "single"},
+            "decoded_cards": [{"code": "11", "display": "SA", "rank_label": "A", "suit_label": "S"}],
+        },
+        # Only 1 pass — top and left haven't responded yet
+        {"event": "player_pass", "seq": 3, "actor": "right"},
+    ]
+    runtime_state = {
+        "turn": "self",  # Cocos UI glitch: shows our turn before trick resolves
+        "current_required_type": "single",
+        "my_cards": [
+            {"sprite_frame": "c26"},
+            {"sprite_frame": "c47"},
+            {"sprite_frame": "c27"},
+            {"sprite_frame": "c48"},
+            {"sprite_frame": "c2T"},
+            {"sprite_frame": "c1J"},
+        ],
+        "my_playable_indexes": [0, 1, 2, 3, 4, 5],
+        "action_buttons": {"pass": {"active": True}},
+        "enemy_profiles": [],
+    }
+
+    observation = build_live_agent_observation(timeline, runtime_state)
+
+    assert observation.turn == "self"
+    # Constraint must NOT be cleared — trick is not over yet
+    assert observation.constraint.last_played_by == "self"
+    # No card in hand can beat SA (hand has H6,C7,H7,C8,HT,SJ — no 2s)
+    # so legal_actions should be pass-only
+    assert all(action.action == "pass" for action in observation.legal_actions)
 
 
 def test_build_live_agent_observation_parses_runtime_enemy_counts_and_seats():

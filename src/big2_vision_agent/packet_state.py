@@ -238,6 +238,16 @@ def _normalize_self_lead_constraint(observation: AgentObservation) -> None:
         return
     if constraint.last_played_by != "self":
         return
+    # Only treat this as a free lead when all 3 opponents have already passed
+    # (passes_since_last_play >= 3), meaning the trick is fully resolved.
+    #
+    # Without this guard, a Cocos UI transitional state can prematurely set
+    # turn="self" after we auto-play (e.g. the opening C3 combo) while top/left
+    # have not yet responded.  That causes _build_runtime_legal_actions to return
+    # all possible plays instead of [pass], so MCTS tries to play into a round
+    # that is not yet over → server rejects with play_not_confirmed.
+    if constraint.passes_since_last_play < 3:
+        return
     # If runtime says it is our turn again and the last recognized play was also ours,
     # the previous trick has already been collected and we are effectively leading a new trick.
     constraint.required_combo_type = None
