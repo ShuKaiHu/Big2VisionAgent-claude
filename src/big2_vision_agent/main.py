@@ -1431,6 +1431,33 @@ async def _build_live_observation(page, runtime_state: dict):
     return build_live_agent_observation(timeline, runtime_state), parsed_events, timeline
 
 
+async def _read_timeline(page):
+    """Fetch the current WS-derived game timeline (round_result events carry the
+    authoritative SERVER scores, unlike the Cocos-derived hand counts)."""
+    from big2_vision_agent.browser.inspector import read_network_log
+    entries = await read_network_log(page)
+    return build_game_timeline(parse_network_entries(entries))
+
+
+def _latest_round_scores(timeline):
+    """Return {actor: {'score':int,'remaining':int,'seq':int}} for the most
+    recent round_result batch (one per actor), or None. Authoritative reward."""
+    rr = [e for e in (timeline or []) if e.get("event") == "round_result"]
+    if not rr:
+        return None
+    max_seq = max(e.get("seq", 0) for e in rr)
+    out = {}
+    for e in rr:
+        if e.get("seq", 0) < max_seq - 8:   # keep only the trailing batch (~4 events)
+            continue
+        a = e.get("actor")
+        if a and (a not in out or e.get("seq", 0) > out[a]["seq"]):
+            out[a] = {"score": e.get("score"),
+                      "remaining": len(e.get("remaining_cards") or []),
+                      "seq": e.get("seq", 0)}
+    return out or None
+
+
 async def save_autoplay_snapshot(page, output_dir, index: int, label: str) -> None:
     filename = f"{index:03d}_{label}.png"
     await page.screenshot(path=str(output_dir / filename), full_page=True)
@@ -2321,6 +2348,11 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             # Persistent results log: all runs append to the same file so
             # long-term win/loss stats accumulate across sessions.
             results_log_path = settings.artifact_dir / "game_results.jsonl"
+            # Authoritative reward log: per-game SERVER round_result scores
+            # (reliable, unlike Cocos hand counts). Append-only, robust to the
+            # in-memory timeline rolling.
+            reward_log_path = settings.artifact_dir / "reward_log.jsonl"
+            last_logged_round_seq: int = -1
 
             def _any_player_emptied(state: dict) -> bool:
                 """Return True when any player's hand has dropped to 0 this game."""
@@ -2507,6 +2539,34 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                             _rf.write(json.dumps(_game_result, ensure_ascii=False) + "\n")
                     except Exception as _e:
                         logger.log(f"Warning: could not write results log: {_e}")
+
+                    # ── Authoritative reward log (SERVER round_result scores) ──────
+                    # Cocos hand counts above are unreliable; the WS round_result
+                    # carries the true per-player score. Capture it NOW (fresh,
+                    # before the in-memory timeline rolls), deduped by round seq.
+                    try:
+                        _tl = await _read_timeline(page)
+                        _rs = _latest_round_scores(_tl)
+                        if _rs and "self" in _rs:
+                            _seq = _rs["self"]["seq"]
+                            if _seq != last_logged_round_seq and _rs["self"]["score"] is not None:
+                                last_logged_round_seq = _seq
+                                _reward_rec = {
+                                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                    "session": games_played + 1,
+                                    "game_in_session": game_number,
+                                    "round_seq": _seq,
+                                    "self_score": _rs["self"]["score"],
+                                    "self_remaining": _rs["self"]["remaining"],
+                                    "scores": {a: v["score"] for a, v in _rs.items()},
+                                    "remaining": {a: v["remaining"] for a, v in _rs.items()},
+                                }
+                                with reward_log_path.open("a", encoding="utf-8") as _rf:
+                                    _rf.write(json.dumps(_reward_rec, ensure_ascii=False) + "\n")
+                                logger.log(f"Reward logged: self_score={_rs['self']['score']:+d} "
+                                           f"(seq={_seq})")
+                    except Exception as _e:
+                        logger.log(f"Warning: could not write reward log: {_e}")
 
                     _result_str = "WIN 🎉" if _placement == 1 else f"{_placement}nd/rd/th"
                     logger.log(
