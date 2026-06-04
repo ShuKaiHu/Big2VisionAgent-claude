@@ -67,11 +67,33 @@ def _load_model() -> Big2Net:
     path = _BEST_PT if os.path.exists(_BEST_PT) else _LATEST_PT
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt["model_state"] if "model_state" in ckpt else ckpt
+    # ── Feature-dim safety guard ───────────────────────────────────────────
+    # A model trained with dominance features (BIG2_DOMINANCE=1, STATIC_DIM 306)
+    # has a 434-wide input_proj; a 302-dim build is 430-wide. load_state_dict
+    # with strict=False would SILENTLY DROP the mismatched input layer, leaving
+    # it randomly initialized → the model plays garbage with NO error. Detect
+    # this and fail LOUDLY with the fix instead.
+    ckpt_in = None
+    for k in ("input_proj.0.weight", "input_proj.weight"):
+        if k in state:
+            ckpt_in = state[k].shape[1]
+            break
+    model_in = model.input_proj[0].weight.shape[1]
+    if ckpt_in is not None and ckpt_in != model_in:
+        import engine.features as _f
+        raise RuntimeError(
+            f"FEATURE-DIM MISMATCH: checkpoint expects input {ckpt_in} but this "
+            f"process builds {model_in} (STATIC_DIM={_f.STATIC_DIM}, "
+            f"DOMINANCE_ON={_f.DOMINANCE_ON}). "
+            f"This v6 model needs dominance features — set BIG2_DOMINANCE=1 "
+            f"before launching. (ckpt {ckpt_in - 128}-dim static vs "
+            f"{model_in - 128}-dim here.)"
+        )
     missing, _ = model.load_state_dict(state, strict=False)
     if missing:
         log.warning("Missing keys (new heads): %s", missing)
     model.eval()
-    log.info("Model loaded from %s", path)
+    log.info("Model loaded from %s (input_dim=%d)", path, model_in)
     return model
 
 _model = _load_model()
@@ -563,8 +585,11 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str]:
         probs, value = _model.predict(static, history, obs_mask)
         masked = probs * obs_mask
         action = int(np.argmax(masked)) if masked.sum() > 0 else enumerateOptions.passInd
-        note = f"greedy:no_env_overlap v={float(value):.3f}"
-        log.info("Greedy policy (no env overlap): action=%d value=%.3f", action, float(value))
+        # value is now a 4-dim vector (per absolute player). The wrapper always
+        # represents "self" as player 1, so our own value is value[0].
+        self_v = float(np.asarray(value).reshape(-1)[0])
+        note = f"greedy:no_env_overlap v={self_v:.3f}"
+        log.info("Greedy policy (no env overlap): action=%d value=%.3f", action, self_v)
         return action, note
 
     # Run MCTS for 1 second (online real-time limit)
