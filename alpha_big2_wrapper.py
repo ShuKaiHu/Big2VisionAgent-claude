@@ -29,7 +29,7 @@ import copy
 # ── Path setup ──────────────────────────────────────────────────────────────
 _AB2_DIR = os.environ.get(
     "ALPHA_BIG2_DIR",
-    "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/.claude/worktrees/lucid-liskov-29de5d",
+    "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude",
 )
 sys.path.insert(0, _AB2_DIR)
 # enumerateOptions.py uses relative path for actionIndices.pkl
