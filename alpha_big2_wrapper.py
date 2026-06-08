@@ -54,6 +54,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Online void-constrained determinization (opt-in, default OFF) ────────────
+# When an opponent passes while a SINGLE leads the trick, a rational player
+# reveals it holds no single higher than that card. We accumulate this as a hard
+# cap on the opponent's max card_id and exclude higher cards when sampling
+# opponent hands for MCTS determinization. This is a RATIONAL-PLAY assumption
+# (humans sometimes pass while saving a high card), so it is gated behind
+# BIG2_VOID=1 and MUST be A/B-validated online — if it hurts (as the soft belief
+# experiment did), leave it off. Default OFF keeps V6 deployment byte-identical.
+_VOID_ON = os.environ.get("BIG2_VOID") == "1"
+if _VOID_ON:
+    log.info("BIG2_VOID=1 → void-constrained determinization ENABLED")
+
 # ── Model loading ────────────────────────────────────────────────────────────
 _CKPT_DIR = os.path.join(_AB2_DIR, "engine", "checkpoints")
 _BEST_PT   = os.path.join(_CKPT_DIR, "best.pt")
@@ -178,6 +190,9 @@ class MockGame:
         self.gameOver: int = 0
         self.rewards: np.ndarray = np.zeros(4)
         self._prev_constraint = {}
+        # BIG2_VOID: per-opponent max card_id they can hold, inferred from passes
+        # on a single lead. 52 = no constraint (no informative pass yet).
+        self.opp_void_single_cap: dict[int, int] = {p: 52 for p in range(2, 5)}
 
     def update(self, obs: dict) -> None:
         gidx = obs.get("game_index", 0)
@@ -233,10 +248,23 @@ class MockGame:
                 self.lastPlayedPlayer = player
                 self.passedThisRound = {p: False for p in range(1, 5)}
 
+        # Void tracking: if a SINGLE leads the current trick (last play = single),
+        # any seat passing reveals it holds no single higher than that card.
+        lead_single = None
+        if _VOID_ON and passes_since > 0:
+            for e in reversed(self.actionHistory):
+                if not e.get("pass") and e.get("hand") is not None:
+                    if len(e["hand"]) == 1:
+                        lead_single = int(e["hand"][0])
+                    break
+
         for i in range(1, passes_since + 1):
             p = ((self.lastPlayedPlayer - 1 + i) % 4) + 1
             if p != 1:
                 self.passedThisRound[p] = True
+                if lead_single is not None and lead_single < self.opp_void_single_cap[p]:
+                    self.opp_void_single_cap[p] = lead_single
+                    log.info("void: 對手 P%d pass 單張 → 手牌上限 card_id<=%d", p, lead_single)
 
         self._prev_constraint = c
 
@@ -289,6 +317,38 @@ class MockGame:
 
 # ── Determinization helpers ───────────────────────────────────────────────────
 
+def _assign_with_void(mock_game: "MockGame", remaining: list, sizes: dict) -> dict[int, np.ndarray]:
+    """Partition `remaining` (already shuffled) to opponents 2/3/4 respecting
+    per-seat void caps (max card_id from passes on a single). Tightest cap first;
+    if a seat cannot be filled from eligible cards, take all eligible and fill
+    the shortfall from the rest (relaxing the cap) so determinization never fails.
+    With all caps = 52 this reduces to a uniform random partition (== no-void)."""
+    caps = mock_game.opp_void_single_cap
+    pool = [int(c) for c in remaining]
+    opp_hands: dict[int, np.ndarray] = {}
+    for p in sorted([2, 3, 4], key=lambda q: caps.get(q, 52)):  # tightest first
+        n = int(sizes[p])
+        cap = caps.get(p, 52)
+        if n <= 0:
+            opp_hands[p] = np.array([], dtype=np.int64)
+            continue
+        eligible = [c for c in pool if c <= cap]
+        if len(eligible) >= n:
+            chosen = [int(c) for c in np.random.choice(eligible, size=n, replace=False)]
+        else:
+            chosen = list(eligible)
+            rest = [c for c in pool if c not in set(chosen)]
+            short = n - len(chosen)
+            if short > 0 and rest:
+                chosen += [int(c) for c in
+                           np.random.choice(rest, size=min(short, len(rest)), replace=False)]
+            log.warning("void: P%d 約束過嚴 (需%d, 合格%d) → 放寬", p, n, len(eligible))
+        chosen_set = set(chosen)
+        opp_hands[p] = np.array(sorted(chosen_set), dtype=np.int64)
+        pool = [c for c in pool if c not in chosen_set]
+    return opp_hands
+
+
 def _sample_opponent_hands(mock_game: MockGame) -> dict[int, np.ndarray]:
     """
     Sample plausible opponent hands given public info.
@@ -328,14 +388,17 @@ def _sample_opponent_hands(mock_game: MockGame) -> dict[int, np.ndarray]:
     # 直接 cap 到 13 即可保持安全（Big2 任何玩家最多持 13 張）。
     sizes = {p: min(13, sizes[p]) for p in [2, 3, 4]}
 
-    opp_hands = {}
-    offset = 0
-    for p in [2, 3, 4]:
-        n = sizes[p]
-        opp_hands[p] = np.array(
-            sorted(remaining[offset : offset + n]), dtype=np.int64
-        )
-        offset += n
+    if _VOID_ON:
+        opp_hands = _assign_with_void(mock_game, remaining, sizes)
+    else:
+        opp_hands = {}
+        offset = 0
+        for p in [2, 3, 4]:
+            n = sizes[p]
+            opp_hands[p] = np.array(
+                sorted(remaining[offset : offset + n]), dtype=np.int64
+            )
+            offset += n
 
     total_needed = sum(sizes[p] for p in [2, 3, 4])
     if total_needed > len(remaining):
