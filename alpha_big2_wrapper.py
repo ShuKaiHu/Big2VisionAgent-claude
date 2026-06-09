@@ -84,7 +84,7 @@ def _load_model() -> Big2Net:
     # ALPHA_BIG2_CKPT lets you A/B a non-default checkpoint online without
     # touching best.pt. Accepts an absolute path OR a name relative to _CKPT_DIR
     # (e.g. "saved/v8_td_deploy.pt"). Unset → default best.pt (V6). Both V6 and
-    # V8 are 306-dim, so launch with BIG2_DOMINANCE=1 either way.
+    # V8 are 306-dim — dominance is baked in (default ON), so NO flag is needed.
     _override = os.environ.get("ALPHA_BIG2_CKPT")
     if _override:
         path = _override if os.path.isabs(_override) else os.path.join(_CKPT_DIR, _override)
@@ -95,7 +95,7 @@ def _load_model() -> Big2Net:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt["model_state"] if "model_state" in ckpt else ckpt
     # ── Feature-dim safety guard ───────────────────────────────────────────
-    # A model trained with dominance features (BIG2_DOMINANCE=1, STATIC_DIM 306)
+    # A model trained with dominance features (baked in, STATIC_DIM 306)
     # has a 434-wide input_proj; a 302-dim build is 430-wide. load_state_dict
     # with strict=False would SILENTLY DROP the mismatched input layer, leaving
     # it randomly initialized → the model plays garbage with NO error. Detect
@@ -111,10 +111,11 @@ def _load_model() -> Big2Net:
         raise RuntimeError(
             f"FEATURE-DIM MISMATCH: checkpoint expects input {ckpt_in} but this "
             f"process builds {model_in} (STATIC_DIM={_f.STATIC_DIM}, "
-            f"DOMINANCE_ON={_f.DOMINANCE_ON}). "
-            f"This v6 model needs dominance features — set BIG2_DOMINANCE=1 "
-            f"before launching. (ckpt {ckpt_in - 128}-dim static vs "
-            f"{model_in - 128}-dim here.)"
+            f"DOMINANCE_ON={_f.DOMINANCE_ON}). Dominance is BAKED IN (default ON, "
+            f"306-dim → 434-input); BIG2_DOMINANCE only DISABLES it (=0 → 302-dim) "
+            f"for the legacy baseline. Fix: loading a 306-dim model → do NOT set "
+            f"BIG2_DOMINANCE=0; loading the 302-dim baseline → set BIG2_DOMINANCE=0. "
+            f"(ckpt {ckpt_in - 128}-dim static vs {model_in - 128}-dim here.)"
         )
     missing, _ = model.load_state_dict(state, strict=False)
     if missing:
