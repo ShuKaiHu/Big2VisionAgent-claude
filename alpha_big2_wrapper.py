@@ -31,7 +31,12 @@ _AB2_DIR = os.environ.get(
     "ALPHA_BIG2_DIR",
     "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude",
 )
+# Resolve Big2VisionAgent root before chdir changes CWD
+_BV_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _AB2_DIR)
+# 看板狀態的單一真相模組（純標準庫，main.py 與本 wrapper 共用，確保結構一致）
+sys.path.insert(0, os.path.join(_BV_DIR, "src"))
+from big2_vision_agent import dashboard_writer
 # enumerateOptions.py uses relative path for actionIndices.pkl
 os.chdir(_AB2_DIR)
 
@@ -76,7 +81,17 @@ torch.set_num_interop_threads(4)
 
 def _load_model() -> Big2Net:
     model = Big2Net()
-    path = _BEST_PT if os.path.exists(_BEST_PT) else _LATEST_PT
+    # ALPHA_BIG2_CKPT lets you A/B a non-default checkpoint online without
+    # touching best.pt. Accepts an absolute path OR a name relative to _CKPT_DIR
+    # (e.g. "saved/v8_td_deploy.pt"). Unset → default best.pt (V6). Both V6 and
+    # V8 are 306-dim, so launch with BIG2_DOMINANCE=1 either way.
+    _override = os.environ.get("ALPHA_BIG2_CKPT")
+    if _override:
+        path = _override if os.path.isabs(_override) else os.path.join(_CKPT_DIR, _override)
+        if not os.path.exists(path):
+            raise RuntimeError(f"ALPHA_BIG2_CKPT not found: {path}")
+    else:
+        path = _BEST_PT if os.path.exists(_BEST_PT) else _LATEST_PT
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt["model_state"] if "model_state" in ckpt else ckpt
     # ── Feature-dim safety guard ───────────────────────────────────────────
@@ -167,7 +182,11 @@ class MockGame:
       When building a big2Game for MCTS: g.goIndex = mock_game.goIndex + 1
     """
 
-    _SEAT = {"self": 1, "left": 2, "top": 3, "right": 4}
+    # 出牌順序：self → right → top → left（伺服器 actor_index 遞增方向，已由
+    # 對局封包驗證）。AlphaBig2 的 player 1→2→3→4 即出牌順序，故：
+    #   self=1, 下家(right)=2, 對家(top)=3, 上家(left)=4。
+    # 先前誤把 left=2/right=4，導致下家/上家顛倒，餵給模型的相鄰關係是反的。
+    _SEAT = {"self": 1, "right": 2, "top": 3, "left": 4}
 
     def __init__(self) -> None:
         self._game_index: int | None = None
@@ -193,6 +212,9 @@ class MockGame:
         # BIG2_VOID: per-opponent max card_id they can hold, inferred from passes
         # on a single lead. 52 = no constraint (no informative pass yet).
         self.opp_void_single_cap: dict[int, int] = {p: 52 for p in range(2, 5)}
+        # Authoritative-rebuild bookkeeping (play_history path):
+        self._logged_events: int = 0      # play_history entries already turned into dashboard events
+        self._last_lead_single: int | None = None  # card_id of the current trick's leading single (void)
 
     def update(self, obs: dict) -> None:
         gidx = obs.get("game_index", 0)
@@ -233,7 +255,93 @@ class MockGame:
             for card in action.get("cards", [])
         )
 
-        # Detect opponent plays between our turns
+        # ── Authoritative play-tracking ────────────────────────────────────────
+        # The observation now carries play_history: the COMPLETE ordered log of
+        # every play/pass this game (built from the full WS timeline). Rebuilding
+        # from it each turn is drift-free — every opponent play is recorded, so
+        # cardsPlayed / actionHistory are exact for the belief + policy models.
+        play_history = obs.get("play_history")
+        if play_history:
+            self.rebuild_from_history(play_history)
+        else:
+            # Backward-compat: legacy snapshot-based incremental detection
+            # (lossy — misses opponents that aren't the immediately-prior player).
+            self._update_from_snapshot(c)
+
+        self._prev_constraint = c
+
+    class _H:
+        """Minimal handPlayed-compatible object for MockGame entries."""
+        def __init__(self, cards: list[int]) -> None:
+            self.hand = np.array(cards, dtype=np.int64)
+
+    def rebuild_from_history(self, play_history: list[dict]) -> None:
+        """Deterministically rebuild ALL play-derived state from the complete,
+        ordered play/pass log of the current game. Replaces the lossy snapshot
+        path: every opponent play is captured, so cardsPlayed (the model's
+        "what each player played" feature) and actionHistory are exact.
+
+        Also drives the dashboard event log via a diff against already-logged
+        entries, so opponents' plays AND passes appear completely."""
+        self.cardsPlayed = np.zeros((4, 52), dtype=np.int32)
+        self.handsPlayed = {}
+        self.actionHistory = []
+        self.goIndex = 0
+        self.passedThisRound = {p: False for p in range(1, 5)}
+        self.lastPlayedPlayer = 1
+        self.opp_void_single_cap = {p: 52 for p in range(2, 5)}
+        self._last_lead_single = None
+
+        for ev in play_history:
+            actor = ev.get("actor")
+            p = self._SEAT.get(actor)
+            if p is None:
+                continue
+            snap = np.array(
+                [1 if self.passedThisRound[q] else 0 for q in range(1, 5)],
+                dtype=np.float32,
+            )
+            if ev.get("action") == "play":
+                card_ids = sorted(_bv_to_id(code) for code in ev.get("card_codes", []))
+                self.goIndex += 1
+                self.actionHistory.append({
+                    "player": p,
+                    "hand": np.array(card_ids, dtype=np.int64),
+                    "pass": False,
+                    "forced_skip": False,
+                    "control_break": False,
+                    "passed_snapshot": snap,
+                })
+                self.handsPlayed[self.goIndex] = MockGame._H(card_ids)
+                for cid in card_ids:
+                    self.cardsPlayed[p - 1][int(cid) - 1] = 1
+                self.lastPlayedPlayer = p
+                # New hand on the table → everyone's pass-flag resets.
+                self.passedThisRound = {q: False for q in range(1, 5)}
+                self._last_lead_single = card_ids[0] if len(card_ids) == 1 else None
+            else:  # pass
+                self.goIndex += 1
+                self.actionHistory.append({
+                    "player": p,
+                    "hand": None,
+                    "pass": True,
+                    "forced_skip": False,
+                    "control_break": False,
+                    "passed_snapshot": snap,
+                })
+                self.passedThisRound[p] = True
+                # Void: passing on a single reveals no single stronger than it.
+                # cap 一律計算（供看板 belief 估計用），是否套用到 MCTS 抽樣才看
+                # _VOID_ON（_sample_opponent_hands）。兩者解耦：看板的對手手牌信心
+                # 總是用得到 void 資訊，MCTS 行為維持原樣。
+                if (p != 1 and self._last_lead_single is not None
+                        and self._last_lead_single < self.opp_void_single_cap[p]):
+                    self.opp_void_single_cap[p] = self._last_lead_single
+        # 看板事件紀錄改由 dashboard_writer.build_events 直接從 play_history 算
+        # （main.py 與 wrapper 共用，完整且一致），此處不再另行累積。
+
+    def _update_from_snapshot(self, c: dict) -> None:
+        """Legacy fallback when play_history is absent. Lossy by design."""
         prev_cards = self._prev_constraint.get("last_played_cards", [])
         prev_by    = self._prev_constraint.get("last_played_by")
         cur_cards  = c.get("last_played_cards", [])
@@ -248,8 +356,6 @@ class MockGame:
                 self.lastPlayedPlayer = player
                 self.passedThisRound = {p: False for p in range(1, 5)}
 
-        # Void tracking: if a SINGLE leads the current trick (last play = single),
-        # any seat passing reveals it holds no single higher than that card.
         lead_single = None
         if _VOID_ON and passes_since > 0:
             for e in reversed(self.actionHistory):
@@ -264,14 +370,6 @@ class MockGame:
                 self.passedThisRound[p] = True
                 if lead_single is not None and lead_single < self.opp_void_single_cap[p]:
                     self.opp_void_single_cap[p] = lead_single
-                    log.info("void: 對手 P%d pass 單張 → 手牌上限 card_id<=%d", p, lead_single)
-
-        self._prev_constraint = c
-
-    class _H:
-        """Minimal handPlayed-compatible object for MockGame entries."""
-        def __init__(self, cards: list[int]) -> None:
-            self.hand = np.array(cards, dtype=np.int64)
 
     def _record_play(self, player: int, card_ids: list[int]) -> None:
         self.goIndex += 1
@@ -291,27 +389,18 @@ class MockGame:
             self.cardsPlayed[player - 1][int(cid) - 1] = 1
 
     def record_our_play(self, card_ids: list[int]) -> None:
-        self._record_play(1, card_ids)
-        self.lastPlayedPlayer = 1
-        self.passedThisRound = {p: False for p in range(1, 5)}
+        # Advisory only on the play_history path: the next observation's
+        # play_history is authoritative and a full rebuild overwrites this.
+        # We still shrink our own hand so any same-turn followup reads are sane.
         played = set(card_ids)
         self.currentHands[1] = np.array(
             [c for c in self.currentHands[1] if c not in played], dtype=np.int64
         )
+        self.lastPlayedPlayer = 1
+        self.passedThisRound = {p: False for p in range(1, 5)}
 
     def record_our_pass(self) -> None:
-        self.goIndex += 1
-        self.actionHistory.append({
-            "player": 1,
-            "hand": None,
-            "pass": True,
-            "forced_skip": False,
-            "control_break": False,
-            "passed_snapshot": np.array(
-                [1 if self.passedThisRound[p] else 0 for p in range(1, 5)],
-                dtype=np.float32,
-            ),
-        })
+        # Advisory only on the play_history path (see record_our_play).
         self.passedThisRound[1] = True
 
 
@@ -408,6 +497,84 @@ def _sample_opponent_hands(mock_game: MockGame) -> dict[int, np.ndarray]:
         )
 
     return opp_hands
+
+
+# ── 對手手牌信心估計（看板用） ────────────────────────────────────────────────
+
+def _unknown_and_sizes(mock_game: MockGame):
+    """未知牌（不在我手、不在已出）與各對手張數。與 _sample_opponent_hands 同邏輯。"""
+    my_hand = set(int(c) for c in mock_game.currentHands[1])
+    played = set()
+    for p in range(4):
+        for c in range(52):
+            if mock_game.cardsPlayed[p][c] == 1:
+                played.add(c + 1)
+    unknown = sorted(set(range(1, 53)) - my_hand - played)
+    total_known = sum(len(mock_game.currentHands[p]) for p in (2, 3, 4))
+    if total_known == 0 and unknown:
+        per = len(unknown) // 3
+        sizes = {2: per, 3: per, 4: len(unknown) - 2 * per}
+    else:
+        sizes = {p: len(mock_game.currentHands[p]) for p in (2, 3, 4)}
+    sizes = {p: min(13, sizes[p]) for p in (2, 3, 4)}
+    return unknown, sizes
+
+
+def _estimate_belief(mock_game: MockGame, n_samples: int = 120):
+    """蒙地卡羅估計每張未知牌落在各對手(2,3,4)的機率。
+
+    重複抽樣 N 次（一律套用 void 約束，因為只是顯示、不影響決策），統計每張
+    未知牌被分到各家的頻率。無 void 資訊時退化為「正比各家張數」的均勻分布。
+    回傳 ({card_id: {2:p, 3:p, 4:p}}, sizes)。"""
+    unknown, sizes = _unknown_and_sizes(mock_game)
+    if not unknown or sum(sizes.values()) == 0:
+        return {}, sizes
+    counts = {cid: {2: 0, 3: 0, 4: 0} for cid in unknown}
+    runs = 0
+    for _ in range(n_samples):
+        remaining = list(unknown)
+        np.random.shuffle(remaining)
+        try:
+            hands = _assign_with_void(mock_game, remaining, sizes)
+        except Exception:
+            continue
+        for p in (2, 3, 4):
+            for cid in hands.get(p, []):
+                ci = int(cid)
+                if ci in counts:
+                    counts[ci][p] += 1
+        runs += 1
+    if runs == 0:
+        return {}, sizes
+    belief = {cid: {p: counts[cid][p] / runs for p in (2, 3, 4)} for cid in unknown}
+    return belief, sizes
+
+
+def _assign_belief(belief: dict, sizes: dict) -> dict:
+    """依 belief 貪婪指派每張未知牌給「機率最高且仍有空位」的對手，張數自洽且穩定
+    （belief 是多次平均，不隨單次抽樣跳動）。
+    回傳 {seat: [(card_id, confidence_prob), ...]}。"""
+    pairs = [(dist[p], cid, p) for cid, dist in belief.items() for p in (2, 3, 4)]
+    pairs.sort(key=lambda t: t[0], reverse=True)   # 機率高者優先指派
+    slots = {p: sizes[p] for p in (2, 3, 4)}
+    assigned: dict[int, int] = {}
+    result: dict[int, list] = {2: [], 3: [], 4: []}
+    for prob, cid, p in pairs:
+        if cid in assigned or slots[p] <= 0:
+            continue
+        assigned[cid] = p
+        slots[p] -= 1
+        result[p].append((cid, prob))
+    return result
+
+
+def _conf_level(prob: float) -> str:
+    """信心等級：機率越集中在這家越有把握。3 家隨機基線約 33%。"""
+    if prob >= 0.55:
+        return "high"   # 綠：明顯集中在這家
+    if prob >= 0.40:
+        return "mid"    # 黃：略高於隨機
+    return "low"        # 紅：接近隨機，沒把握
 
 
 def _build_game_for_mcts(mock_game: MockGame, opp_hands: dict[int, np.ndarray]) -> big2Game:
@@ -557,21 +724,18 @@ def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray) -> np.ndarray:
 
 # ── Inference (MCTS + determinization) ───────────────────────────────────────
 
-def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str]:
-    """回傳 (action_idx, ml_note)。ml_note 會寫入 AgentDecision.note，
-    在 run.log 裡可見，用來確認 ML 運算是否正常。"""
+def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
+    """回傳 (action_idx, ml_note, extra)。
+    extra 包含 policy_probs、visits、opp_hands，供 dashboard 顯示。"""
     import time
+    extra: dict = {}
 
-    # Build valid action mask from legal_actions (ground truth from server)
     obs_mask = _build_mask(obs)
     legal = np.flatnonzero(obs_mask)
     if len(legal) == 0:
         log.warning("No legal actions — defaulting to pass")
-        return enumerateOptions.passInd, "fallback:no_legal_actions"
+        return enumerateOptions.passInd, "fallback:no_legal_actions", extra
 
-    # ── mustPlayClub3：開局必須出含梅花三的牌，不得 PASS ─────────────────
-    # packet parser 有時把 pass 放進 legal_actions，但遊戲伺服器會拒絕。
-    # 直接把 pass 從 mask 移除，讓 MCTS 只能選含梅花三的出法。
     if mock_game.mustPlayClub3:
         obs_mask[enumerateOptions.passInd] = 0.0
         legal = np.flatnonzero(obs_mask)
@@ -580,41 +744,30 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str]:
             obs_mask[enumerateOptions.passInd] = 1.0
             legal = np.array([enumerateOptions.passInd])
 
-    # ── One-card rule: when any opponent has 1 card, only highest single legal ─
-    # Applies to both lead and follower situations. Must run BEFORE early-exit
-    # so the pass-only check sees the filtered mask.
     obs_mask = _apply_one_card_rule(obs, obs_mask)
-    legal = np.flatnonzero(obs_mask)   # recompute after filter
+    legal = np.flatnonzero(obs_mask)
+    extra["obs_mask"] = obs_mask
 
-    # ── Early exit: if the only legal action is pass, no need for MCTS ────
-    # This is common when we can't beat the current table hand.
+    # determinization：先算好供看板顯示對手推測手牌（即使只能 pass 也要有）。
+    opp_hands = _sample_opponent_hands(mock_game)
+    extra["opp_hands"] = opp_hands
+
     non_pass_legal = [a for a in legal if a != enumerateOptions.passInd]
     if len(non_pass_legal) == 0:
-        return enumerateOptions.passInd, "only_legal:pass"
+        return enumerateOptions.passInd, "only_legal:pass", extra
 
-    # Sample opponent hands (determinization)
-    opp_hands = _sample_opponent_hands(mock_game)
     g = _build_game_for_mcts(mock_game, opp_hands)
 
-    # Wrap in Big2Env
     env = Big2Env.__new__(Big2Env)
     env._game = g
     env._done = False
 
-    # ── ALWAYS sync critical game state from obs (authoritative ground truth) ─
-    # MockGame can drift from reality (missed opponent plays, wrong control
-    # flag).  obs.constraint is the server's ground truth — always apply it
-    # before querying get_valid_actions() so the env stays consistent.
     c = obs.get("constraint", {})
     last_played = c.get("last_played_cards", [])
     lead_actor  = c.get("lead_actor")
 
-    # control=0 only when there are cards on the table AND we are not the
-    # lead actor (we need to beat the last hand).
     if lead_actor is None and last_played:
         g.control = 0
-        # Replace handsPlayed[goIndex-1] with the actual table hand so
-        # returnAvailableActions reads the right cards to beat.
         last_card_ids = sorted(_bv_to_id(card["code"]) for card in last_played)
         if g.goIndex == 0:
             g.goIndex = 1
@@ -622,59 +775,349 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str]:
     else:
         g.control = 1
 
-    # It is definitely our turn; make sure the game knows.
     g.playersGo = 1
-    # We have not passed this round (we are about to act).
     g.passedThisRound[1] = False
 
-    # Verify that the env's valid actions overlap with obs_mask
     env_mask = env.get_valid_actions()
     overlap = (env_mask * obs_mask).sum()
+
+    # Policy 評分（一次 forward pass，成本遠小於 MCTS）
+    from engine.features import encode_static, encode_history_steps
+    static  = encode_static(mock_game, 1)
+    history = encode_history_steps(mock_game)
+    policy_probs, value = _model.predict(static, history, obs_mask)
+    extra["policy_probs"] = policy_probs
+
     if overlap == 0:
-        # Debug: log what obs_mask and env_mask contain to understand the mismatch
         obs_legal_indices = np.flatnonzero(obs_mask).tolist()
         env_legal_indices = np.flatnonzero(env_mask).tolist()
-        obs_n = len(obs_legal_indices)
-        env_n = len(env_legal_indices)
         log.warning(
             "No env/obs overlap after sync | control=%d goIndex=%d | "
             "obs_mask has %d actions (indices: %s) | env_mask has %d actions (sample: %s)",
-            g.control, g.goIndex, obs_n, obs_legal_indices[:5], env_n, env_legal_indices[:5],
+            g.control, g.goIndex, len(obs_legal_indices), obs_legal_indices[:5],
+            len(env_legal_indices), env_legal_indices[:5],
         )
         log.warning("Falling back to greedy policy")
-        from engine.features import encode_static, encode_history_steps
-        static  = encode_static(mock_game, 1)
-        history = encode_history_steps(mock_game)
-        probs, value = _model.predict(static, history, obs_mask)
-        masked = probs * obs_mask
+        masked = policy_probs * obs_mask
         action = int(np.argmax(masked)) if masked.sum() > 0 else enumerateOptions.passInd
-        # value is now a 4-dim vector (per absolute player). The wrapper always
-        # represents "self" as player 1, so our own value is value[0].
         self_v = float(np.asarray(value).reshape(-1)[0])
         note = f"greedy:no_env_overlap v={self_v:.3f}"
         log.info("Greedy policy (no env overlap): action=%d value=%.3f", action, self_v)
-        return action, note
+        return action, note, extra
 
-    # Run MCTS for 1 second (online real-time limit)
     t0 = time.time()
     action, visits = _mcts.run(env, temperature=0.0, time_limit=1.0)
     elapsed = time.time() - t0
     n_sims = int(visits.sum())
+    extra["visits"] = visits
     log.info("MCTS: %d sims in %.2fs → action=%d", n_sims, elapsed, action)
 
-    # Restrict to actions that are ACTUALLY legal (obs_mask is ground truth)
     if obs_mask[action] == 0:
         log.warning("MCTS chose action %d not in obs_mask — restricting to legal", action)
         masked_visits = visits * obs_mask
         action = int(np.argmax(masked_visits)) if masked_visits.sum() > 0 else int(legal[0])
 
     note = f"mcts:{n_sims}sims_{elapsed:.2f}s"
-    return action, note
+    return action, note, extra
+
+
+# ── Dashboard state writer ────────────────────────────────────────────────────
+
+_DASH_STATE_PATH = os.path.join(_BV_DIR, "state", "dashboard_state.json")
+
+_SUIT_SYM = {"S": "♠", "H": "♥", "D": "♦", "C": "♣"}
+_RANK_CHAR_DISP = {
+    "1": "A", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
+    "7": "7", "8": "8", "9": "9", "T": "10", "J": "J", "Q": "Q", "K": "K",
+}
+
+_dash_stats: dict = {
+    "decisions": 0, "plays": 0, "passes": 0, "fallbacks": 0,
+    "mcts_total_sims": 0, "mcts_total_time_s": 0.0,
+}
+_dash_events: list[dict] = []
+_MAX_EVENTS = 60
+
+# player index ↔ 座位字串 ↔ 中文。出牌順序 self(1)→right(2)→top(3)→left(4)。
+_SEAT_ID  = {1: "self", 2: "right", 3: "top", 4: "left"}
+_SEAT_ZH  = {"self": "自己", "right": "下家", "top": "對家", "left": "上家"}
+_COMBO_ZH_MAP = {
+    "single": "單張", "pair": "對子", "straight": "順子",
+    "full_house": "葫蘆", "four_of_kind": "四條",
+    "four_of_a_kind": "四條", "straight_flush": "同花順",
+}
+
+
+def _combo_from_ids(card_ids) -> str | None:
+    n = len(card_ids)
+    if n == 1: return "single"
+    if n == 2: return "pair"
+    if n == 5: return _five_combo_type(list(card_ids))
+    return None
+
+
+def _log_event(seat: str, ev_type: str, cards: list[str], combo: str | None) -> None:
+    from datetime import datetime as _dt
+    ts      = _dt.now().strftime("%H:%M:%S")
+    zh      = _SEAT_ZH.get(seat, seat)
+    czh     = _COMBO_ZH_MAP.get(combo or "", "")
+    if ev_type == "play":
+        cs  = " ".join(cards)
+        msg = f"{zh} 出牌：{cs}（{czh}）" if czh else f"{zh} 出牌：{cs}"
+    elif ev_type == "pass":
+        msg = f"{zh} PASS"
+    else:
+        msg = f"{zh} {ev_type}"
+    _dash_events.append({"ts": ts, "type": ev_type, "actor": seat, "cards": cards, "combo": combo, "msg": msg})
+    if len(_dash_events) > _MAX_EVENTS:
+        _dash_events.pop(0)
+
+
+def _card_sym(card: dict) -> str:
+    d = card.get("display", "")
+    if not d:
+        return card.get("code", "?")
+    return _SUIT_SYM.get(d[0], d[0]) + d[1:]
+
+
+def _code_sym(code: str) -> str:
+    if len(code) < 2:
+        return code
+    suit = {"1": "♠", "2": "♥", "3": "♦", "4": "♣"}.get(code[0], code[0])
+    rank = _RANK_CHAR_DISP.get(code[1], code[1:])
+    return suit + rank
+
+
+def _parse_ml_note(note: str) -> dict:
+    import re as _re
+    info: dict = {"mode": "unknown", "mcts_sims": None, "mcts_time_s": None}
+    if not note:
+        return info
+    m = _re.match(r"mcts:(\d+)sims_([\d.]+)s", note)
+    if m:
+        info.update(mode="mcts", mcts_sims=int(m.group(1)), mcts_time_s=float(m.group(2)))
+    elif note.startswith("greedy:"):
+        info["mode"] = "greedy"
+    elif note.startswith("only_legal:"):
+        info["mode"] = "forced"
+    elif note.startswith("fallback:"):
+        info["mode"] = "fallback"
+    return info
+
+
+def _action_idx_from_legal(la: dict) -> int | None:
+    """把 obs legal_action dict 轉成 enumerateOptions action index。"""
+    try:
+        if la.get("action") == "pass":
+            return enumerateOptions.passInd
+        cards = la.get("cards", [])
+        n = len(cards)
+        if n == 0:
+            return None
+        ids = tuple(sorted(_bv_to_id(c["code"]) for c in cards))
+        if n == 1:
+            return enumerateOptions.SINGLE_INDEX[ids[0]]
+        if n == 2:
+            return enumerateOptions.PAIR_OFFSET + enumerateOptions.PAIR_INDEX[ids]
+        if n == 5:
+            return enumerateOptions.FIVE_OFFSET + enumerateOptions.FIVE_INDEX[ids]
+    except Exception:
+        pass
+    return None
+
+
+def _scored_legal_actions(obs: dict, infer_extra: dict, chosen_idx: int) -> list[dict]:
+    """每個合法動作加上 policy% 和 MCTS visit%。"""
+    policy_probs = infer_extra.get("policy_probs")
+    visits       = infer_extra.get("visits")
+    total_visits = int(visits.sum()) if visits is not None else 0
+
+    result = []
+    for la in obs.get("legal_actions", []):
+        idx = _action_idx_from_legal(la)
+        cards_sym = [_card_sym(c) for c in la.get("cards", [])]
+        combo     = la.get("combo_type") or ("pass" if la.get("action") == "pass" else None)
+        combo_zh  = _COMBO_ZH_MAP.get(combo or "", "PASS" if la.get("action") == "pass" else "")
+
+        policy_pct  = None
+        visit_count = None
+        visit_pct   = None
+        if idx is not None and policy_probs is not None and idx < len(policy_probs):
+            policy_pct = float(policy_probs[idx]) * 100
+        if idx is not None and visits is not None and idx < len(visits):
+            visit_count = int(visits[idx])
+            visit_pct   = visit_count / total_visits * 100 if total_visits > 0 else 0.0
+
+        result.append({
+            "action":      la.get("action"),
+            "cards":       cards_sym,
+            "combo_type":  combo,
+            "combo_zh":    combo_zh,
+            "action_idx":  idx,
+            "policy_pct":  round(policy_pct, 1) if policy_pct is not None else None,
+            "visits":      visit_count,
+            "visit_pct":   round(visit_pct, 1) if visit_pct is not None else None,
+            "chosen":      (idx is not None and idx == chosen_idx),
+        })
+
+    # 按 policy_pct 降序排（MCTS 沒跑時也有合理排序），PASS 放最後
+    def _sort_key(x):
+        is_pass = x["action"] == "pass"
+        pct = x["policy_pct"] if x["policy_pct"] is not None else -1.0
+        return (is_pass, -pct)
+    result.sort(key=_sort_key)
+    return result
+
+
+def _build_players_data(obs: dict, mock_game: MockGame, infer_extra: dict) -> list[dict]:
+    """回傳 4 個 seat 的資料列表（self=1, left=2, top=3, right=4）。"""
+    opp_hands = infer_extra.get("opp_hands", {})
+    # opponents 的 seat 是字串（left/top/right）→ 轉成整數 seat 對應，
+    # 否則 int 查 str-key 永遠 miss，remaining 會悄悄退回 len(currentHands)。
+    _seat_str2int = {"right": 2, "top": 3, "left": 4}
+    opp_count: dict[int, int | None] = {}
+    for opp in obs.get("opponents", []):
+        s = _seat_str2int.get(opp.get("seat"))
+        if s is not None:
+            opp_count[s] = opp.get("remaining_count")
+
+    players = []
+    for seat in [1, 2, 3, 4]:
+        seat_id = _SEAT_ID[seat]
+        seat_zh = _SEAT_ZH[seat_id]
+
+        # 已出牌（從 cardsPlayed 矩陣，0-indexed player，0-indexed card_id）
+        played_ids = [c + 1 for c in range(52) if mock_game.cardsPlayed[seat - 1][c] == 1]
+        played_syms = [_code_sym(_id_to_bv(cid)) for cid in sorted(played_ids, key=lambda cid: _bv_sort_key(_id_to_bv(cid)))]
+
+        # 已出張數（完整追蹤，cardsPlayed 由 play_history 重建，無遺漏）
+        known_played = len(played_ids)
+
+        if seat == 1:
+            remaining = obs.get("hand_count", len(obs.get("self_hand", [])))
+            played_total = 13 - remaining  # 精確
+            # 自己手牌：已知，依牌力由小到大排序
+            self_hand_sorted = sorted(obs.get("self_hand", []), key=lambda c: _bv_sort_key(c.get("code", "")))
+            hand_syms = [_card_sym(c) for c in self_hand_sorted]
+            is_estimated = False
+        else:
+            # ── 對手剩餘張數：精確計算，永不為 None ──────────────────────────
+            # 每家開局 13 張，cardsPlayed 已完整追蹤 → 剩餘 = 13 - 已出。
+            # 這比依賴 UI remaining_count（可能讀不到）更可靠，也保證有值。
+            remaining = 13 - known_played
+            played_total = known_played
+            # 與 UI 讀數交叉驗證：不一致代表追蹤可能有漏，記警告以便偵測。
+            ui_remaining = opp_count.get(seat)
+            if ui_remaining is not None and ui_remaining != remaining:
+                log.warning(
+                    "對手 %s 剩餘張數不一致：追蹤=%d UI=%d（已出%d張）— 可能有漏追蹤",
+                    seat_id, remaining, ui_remaining, known_played,
+                )
+                # UI 是遊戲真實顯示，視為 ground truth；以它為準。
+                remaining = ui_remaining
+                played_total = 13 - ui_remaining
+            if seat in opp_hands and len(opp_hands[seat]) > 0:
+                # 對手估計牌：依牌力由小到大排序
+                sorted_ids = sorted(opp_hands[seat], key=lambda cid: _bv_sort_key(_id_to_bv(int(cid))))
+                hand_syms = [_code_sym(_id_to_bv(int(cid))) for cid in sorted_ids]
+                is_estimated = True
+            else:
+                hand_syms = []
+                is_estimated = False
+
+        players.append({
+            "seat":          seat,
+            "seat_id":       seat_id,
+            "seat_zh":       seat_zh,
+            "remaining":     remaining,
+            "played":        played_syms,
+            "played_total":  played_total,   # 實際出牌總數（伺服器推算）
+            "hand":          hand_syms,
+            "is_estimated":  is_estimated,
+        })
+    return players
+
+
+def _bv_sort_key(bv_code: str) -> tuple:
+    _rank_order = {"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"T":10,"J":11,"Q":12,"K":13,"1":14,"2":15}
+    _suit_order = {"4":1,"3":2,"2":3,"1":4}  # C<D<H<S
+    if len(bv_code) < 2:
+        return (99, 99)
+    return (_rank_order.get(bv_code[1], 99), _suit_order.get(bv_code[0], 99))
+
+
+def _write_dashboard_state(
+    obs: dict, decision: dict, ml_note: str,
+    infer_extra: dict | None = None,
+    mock_game: "MockGame | None" = None,
+) -> None:
+    from datetime import datetime as _dt
+    if infer_extra is None:
+        infer_extra = {}
+    try:
+        note_info = _parse_ml_note(ml_note)
+
+        _dash_stats["decisions"] += 1
+        if decision["action"] == "pass":
+            _dash_stats["passes"] += 1
+        else:
+            _dash_stats["plays"] += 1
+        if note_info["mode"] in ("fallback", "greedy"):
+            _dash_stats["fallbacks"] += 1
+        if note_info["mcts_sims"] is not None:
+            _dash_stats["mcts_total_sims"] += note_info["mcts_sims"]
+        if note_info["mcts_time_s"] is not None:
+            _dash_stats["mcts_total_time_s"] += note_info["mcts_time_s"]
+
+        # 對手推測手牌 + 信心：用 belief 蒙地卡羅估計每張未知牌的家別機率，
+        # 再貪婪指派（穩定、張數自洽）。→ {player_index: [(bv_code, conf_level)]}
+        opp_hands_codes: dict[int, list[tuple[str, str]]] = {}
+        if mock_game is not None:
+            belief, sizes = _estimate_belief(mock_game)
+            if belief:
+                for seat, items in _assign_belief(belief, sizes).items():
+                    opp_hands_codes[seat] = [
+                        (_id_to_bv(cid), _conf_level(prob)) for cid, prob in items
+                    ]
+
+        # 決策牌符號 + 選中的 action index
+        decision_cards = [dashboard_writer.code_to_symbol(code) for code in decision.get("card_codes", [])]
+        chosen_idx = _action_idx_from_legal({
+            "action": decision["action"],
+            "cards":  [{"code": code} for code in decision.get("card_codes", [])],
+            "combo_type": decision.get("combo_type"),
+        }) if decision["action"] != "pass" else enumerateOptions.passInd
+
+        # 牌況核心（players/events/constraint/turn）由共用模組建構 → 與 main.py 完全一致。
+        # wrapper 額外帶 AI 決策選項、對手推測手牌、本場統計。
+        state = dashboard_writer.base_state(obs, opp_hands=opp_hands_codes)
+        state["legal_actions"] = _scored_legal_actions(obs, infer_extra, chosen_idx)
+        state["last_decision"] = {
+            "action":     decision["action"],
+            "cards":      decision_cards,
+            "combo_type": decision.get("combo_type"),
+            "combo_zh":   _COMBO_ZH_MAP.get(decision.get("combo_type") or "", ""),
+            "note":       ml_note,
+            **note_info,
+        }
+        state["session"] = dict(_dash_stats)
+
+        dashboard_writer.atomic_write(_DASH_STATE_PATH, state)
+    except Exception as _e:
+        log.debug("dashboard write failed: %s", _e)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # 啟動時清空舊狀態，讓 dashboard 從空白開始
+    try:
+        os.makedirs(os.path.dirname(_DASH_STATE_PATH), exist_ok=True)
+        with open(_DASH_STATE_PATH, "w", encoding="utf-8") as _f:
+            json.dump({"__status": "waiting", "updated_at": None}, _f)
+    except Exception:
+        pass
+
     game = MockGame()
 
     for raw in sys.stdin:
@@ -684,7 +1127,7 @@ def main() -> None:
         try:
             obs = json.loads(raw)
             game.update(obs)
-            action_idx, ml_note = _infer(game, obs)
+            action_idx, ml_note, infer_extra = _infer(game, obs)
             decision   = _to_decision(action_idx)
 
             # Keep MockGame in sync with our own decision
@@ -698,6 +1141,7 @@ def main() -> None:
             decision["note"] = ml_note
             log.info("→ %s %s (%s) [%s]", decision["action"], decision["card_codes"], decision["combo_type"], ml_note)
             print(json.dumps(decision), flush=True)
+            _write_dashboard_state(obs, decision, ml_note, infer_extra, game)
 
         except Exception as exc:
             import traceback
