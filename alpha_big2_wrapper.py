@@ -241,11 +241,12 @@ class MockGame:
         c = obs.get("constraint", {})
         last_played = c.get("last_played_cards", [])
         lead_actor  = c.get("lead_actor")
-        # control=1（自由出牌）的條件：
-        #   - lead_actor 明確設定（有人主導這一墩），或
-        #   - 牌桌上沒有牌（全新一墩，包含開局 mustPlayClub3 的情況）
-        # control=0（必須跟牌）只在 lead_actor=None 且桌上有牌時成立。
-        self.control = 1 if (lead_actor is not None or not last_played) else 0
+        # lead_actor = 當前這一墩的「控制者」(上一個出牌且未被蓋過的人)。
+        # 自由出牌(control=1)：桌面無牌(新墩) 或 自己就是控制者(lead_actor==self,
+        #   代表別人都 pass、輪回自己開新墩)。
+        # 跟牌(control=0)：桌上有牌且由「別家」主導(lead_actor 是別人或 None)→ 必須壓過。
+        # 註:跟牌時 lead_actor 是別家(非 None),故不能用「is not None」判成自由出牌(舊 bug)。
+        self.control = 1 if (not last_played or lead_actor == "self") else 0
         self.playersGo = self._SEAT.get(obs.get("turn", "self"), 1)
 
         # mustPlayClub3: 3♣ = card_id 1 must be in legal play
@@ -827,7 +828,10 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
     last_played = c.get("last_played_cards", [])
     lead_actor  = c.get("lead_actor")
 
-    if lead_actor is None and last_played:
+    # 跟牌 iff 桌上有牌且非自己主導(只有 lead_actor==self 才是自己開的墩)。
+    # 跟牌時務必把「桌上要壓的牌」設進 env(handsPlayed),否則 MCTS 會誤以為在自由
+    # 開牌、去搜不合法的領牌手 → 真正的跟牌決策沒被搜到(舊 bug:用 lead_actor is None)。
+    if last_played and lead_actor != "self":
         g.control = 0
         last_card_ids = sorted(_bv_to_id(card["code"]) for card in last_played)
         if g.goIndex == 0:
