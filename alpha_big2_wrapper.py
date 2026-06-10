@@ -723,6 +723,66 @@ def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray) -> np.ndarray:
     return new_mask
 
 
+# ── Per-move MCTS content log (append-only JSONL, always on) ─────────────────
+# Persists every MCTS decision (top candidates with visit%, 4-dim value, raw
+# policy top, chosen action, board context) so online games can be inspected /
+# later mined for training. Wrapped in try/except so a logging failure can never
+# affect play. Lives next to reward_log.jsonl.
+import datetime as _dt
+_MCTS_LOG_PATH = os.path.join(_BV_DIR, "artifacts", "mcts_moves.jsonl")
+_CID_RANK = {1:"3",2:"4",3:"5",4:"6",5:"7",6:"8",7:"9",8:"10",9:"J",10:"Q",11:"K",12:"A",13:"2"}
+_CID_SUIT = {1:"♣",2:"♦",3:"♥",4:"♠"}
+
+
+def _cid_label(cid: int) -> str:
+    cid = int(cid)
+    return _CID_SUIT[(cid - 1) % 4 + 1] + _CID_RANK[(cid - 1) // 4 + 1]
+
+
+def _action_cards(action: int):
+    """Action index → readable card labels (or 'PASS')."""
+    if action == enumerateOptions.passInd:
+        return "PASS"
+    cs, _n = enumerateOptions.getOptionNC(action)
+    return [_cid_label(c) for c in cs]
+
+
+def _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, elapsed):
+    try:
+        v = np.asarray(value).reshape(-1)
+        vis = np.asarray(visits).reshape(-1)
+        pol = np.asarray(policy_probs).reshape(-1)
+        tot = float(vis.sum()) or 1.0
+        mcts_top = [{"cards": _action_cards(int(a)), "visits": int(vis[a]),
+                     "pct": round(float(vis[a]) / tot * 100, 1)}
+                    for a in np.argsort(vis)[::-1][:5] if vis[a] > 0]
+        policy_top = [{"cards": _action_cards(int(a)), "prob": round(float(pol[a]), 3)}
+                      for a in np.argsort(pol)[::-1][:5] if pol[a] > 0.01]
+        c = obs.get("constraint", {})
+        to_beat = [_cid_label(_bv_to_id(card["code"])) for card in c.get("last_played_cards", [])]
+        rec = {
+            "ts": _dt.datetime.now().isoformat(timespec="seconds"),
+            "game_index": obs.get("game_index"),
+            "control": "lead" if mock_game.control == 1 else "follow",
+            "my_hand": [_cid_label(x) for x in sorted(int(c) for c in mock_game.currentHands[1])],
+            "to_beat": to_beat or None,
+            "opp_counts": {"right": int(len(mock_game.currentHands[2])),
+                           "top": int(len(mock_game.currentHands[3])),
+                           "left": int(len(mock_game.currentHands[4]))},
+            "n_sims": int(n_sims), "elapsed_s": round(float(elapsed), 2),
+            "value4": {"self": round(float(v[0]), 3), "right": round(float(v[1]), 3),
+                       "top": round(float(v[2]), 3), "left": round(float(v[3]), 3)},
+            "mcts_top": mcts_top,
+            "policy_top": policy_top,
+            "chosen": _action_cards(int(action)),
+        }
+        os.makedirs(os.path.dirname(_MCTS_LOG_PATH), exist_ok=True)
+        with open(_MCTS_LOG_PATH, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:  # logging must never break play
+        log.warning("mcts-move log failed: %s", e)
+
+
 # ── Inference (MCTS + determinization) ───────────────────────────────────────
 
 def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
@@ -817,6 +877,8 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
         log.warning("MCTS chose action %d not in obs_mask — restricting to legal", action)
         masked_visits = visits * obs_mask
         action = int(np.argmax(masked_visits)) if masked_visits.sum() > 0 else int(legal[0])
+
+    _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, elapsed)
 
     note = f"mcts:{n_sims}sims_{elapsed:.2f}s"
     return action, note, extra
