@@ -122,10 +122,24 @@ def _load_model() -> Big2Net:
         log.warning("Missing keys (new heads): %s", missing)
     model.eval()
     log.info("Model loaded from %s (input_dim=%d)", path, model_in)
-    return model
 
-_model = _load_model()
-_mcts  = MCTS(_model, n_simulations=200)   # fallback if time_limit not used
+    # V9: the checkpoint may carry a full-info (god-view) value net. When it
+    # does, MCTS leaf evaluation uses it and _infer switches to MULTI-sample
+    # determinization (a full-info value on a single guessed world would be
+    # overconfident in one possibly-wrong guess; averaging N worlds ≈ expectation
+    # over consistent worlds). No flag: presence in the checkpoint decides.
+    value_model = None
+    if isinstance(ckpt, dict) and "value_state" in ckpt:
+        from engine.model import Big2ValueNet
+        value_model = Big2ValueNet()
+        value_model.load_state_dict(ckpt["value_state"])
+        value_model.eval()
+        log.info("Full-info value net loaded (V9) → multi-determinization MCTS")
+    return model, value_model
+
+_model, _value_model = _load_model()
+_mcts  = MCTS(_model, n_simulations=200, value_model=_value_model)
+_N_DETS = 4 if _value_model is not None else 1   # worlds per move (V9: average 4)
 
 # ── Card-code conversion ─────────────────────────────────────────────────────
 # Big2Vision code: "<suit_char><rank_char>"
@@ -824,32 +838,35 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
     if len(non_pass_legal) == 0:
         return enumerateOptions.passInd, "only_legal:pass", extra
 
-    g = _build_game_for_mcts(mock_game, opp_hands)
+    def _build_search_env(opp_hands_i):
+        """One determinized world → a Big2Env ready for MCTS."""
+        g = _build_game_for_mcts(mock_game, opp_hands_i)
+        env = Big2Env.__new__(Big2Env)
+        env._game = g
+        env._done = False
 
-    env = Big2Env.__new__(Big2Env)
-    env._game = g
-    env._done = False
+        c = obs.get("constraint", {})
+        last_played = c.get("last_played_cards", [])
+        last_played_by = c.get("last_played_by")
 
-    c = obs.get("constraint", {})
-    last_played = c.get("last_played_cards", [])
-    last_played_by = c.get("last_played_by")
+        # 跟牌 iff 桌上有牌且那張牌是「別家」打的(last_played_by != self)。
+        # 跟牌時務必把「桌上要壓的牌」設進 env(handsPlayed),否則 MCTS 會誤以為在自由
+        # 開牌、去搜不合法的領牌手(葫蘆跟單張)→ 真正的跟牌決策沒被搜到。
+        # (lead_actor 在跟牌時仍回報 self,不可靠;改用 last_played_by。)
+        if last_played and last_played_by != "self":
+            g.control = 0
+            last_card_ids = sorted(_bv_to_id(card["code"]) for card in last_played)
+            if g.goIndex == 0:
+                g.goIndex = 1
+            g.handsPlayed[g.goIndex - 1] = MockGame._H(last_card_ids)
+        else:
+            g.control = 1
 
-    # 跟牌 iff 桌上有牌且那張牌是「別家」打的(last_played_by != self)。
-    # 跟牌時務必把「桌上要壓的牌」設進 env(handsPlayed),否則 MCTS 會誤以為在自由
-    # 開牌、去搜不合法的領牌手(葫蘆跟單張)→ 真正的跟牌決策沒被搜到。
-    # (lead_actor 在跟牌時仍回報 self,不可靠;改用 last_played_by。)
-    if last_played and last_played_by != "self":
-        g.control = 0
-        last_card_ids = sorted(_bv_to_id(card["code"]) for card in last_played)
-        if g.goIndex == 0:
-            g.goIndex = 1
-        g.handsPlayed[g.goIndex - 1] = MockGame._H(last_card_ids)
-    else:
-        g.control = 1
+        g.playersGo = 1
+        g.passedThisRound[1] = False
+        return env
 
-    g.playersGo = 1
-    g.passedThisRound[1] = False
-
+    env = _build_search_env(opp_hands)
     env_mask = env.get_valid_actions()
     overlap = (env_mask * obs_mask).sum()
 
@@ -878,11 +895,32 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
         return action, note, extra
 
     t0 = time.time()
-    action, visits = _mcts.run(env, temperature=0.0, time_limit=1.0)
+    if _N_DETS <= 1:
+        action, visits = _mcts.run(env, temperature=0.0, time_limit=1.0)
+        n_sims = int(visits.sum())
+    else:
+        # V9 multi-determinization: sample N consistent worlds, search each with
+        # an equal slice of the 1s budget, and average the (normalized) visit
+        # distributions — the full-info value net's verdicts are only meaningful
+        # in expectation over worlds, not on one guess.
+        dist = None
+        n_sims = 0
+        for i in range(_N_DETS):
+            env_i = env if i == 0 else _build_search_env(_sample_opponent_hands(mock_game))
+            _, visits_i = _mcts.run(env_i, temperature=0.0, time_limit=1.0 / _N_DETS)
+            tot_i = visits_i.sum()
+            n_sims += int(tot_i)
+            if tot_i > 0:
+                d = visits_i / tot_i
+                dist = d if dist is None else dist + d
+        if dist is None:
+            dist = np.zeros(enumerateOptions.passInd + 1, dtype=np.float32)
+        # rescale to total raw sims so downstream int(visits) / pct math still works
+        visits = dist / _N_DETS * max(n_sims, 1)
+        action = int(np.argmax(visits))
     elapsed = time.time() - t0
-    n_sims = int(visits.sum())
     extra["visits"] = visits
-    log.info("MCTS: %d sims in %.2fs → action=%d", n_sims, elapsed, action)
+    log.info("MCTS: %d sims in %.2fs (%d det) → action=%d", n_sims, elapsed, _N_DETS, action)
 
     if obs_mask[action] == 0:
         log.warning("MCTS chose action %d not in obs_mask — restricting to legal", action)
@@ -891,7 +929,7 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
 
     _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, elapsed)
 
-    note = f"mcts:{n_sims}sims_{elapsed:.2f}s"
+    note = f"mcts:{n_sims}sims_{elapsed:.2f}s" + (f"_{_N_DETS}det" if _N_DETS > 1 else "")
     return action, note, extra
 
 
