@@ -240,13 +240,14 @@ class MockGame:
         # Flags from constraint
         c = obs.get("constraint", {})
         last_played = c.get("last_played_cards", [])
-        lead_actor  = c.get("lead_actor")
-        # lead_actor = 當前這一墩的「控制者」(上一個出牌且未被蓋過的人)。
-        # 自由出牌(control=1)：桌面無牌(新墩) 或 自己就是控制者(lead_actor==self,
-        #   代表別人都 pass、輪回自己開新墩)。
-        # 跟牌(control=0)：桌上有牌且由「別家」主導(lead_actor 是別人或 None)→ 必須壓過。
-        # 註:跟牌時 lead_actor 是別家(非 None),故不能用「is not None」判成自由出牌(舊 bug)。
-        self.control = 1 if (not last_played or lead_actor == "self") else 0
+        last_played_by = c.get("last_played_by")
+        # 判斷「跟牌 vs 自由出牌」用 last_played_by(桌上那張牌是誰打的),不是 lead_actor。
+        #   - 自由出牌(control=1)：桌面無牌(新墩) 或 桌上那張是「自己」打的(別人都 pass、
+        #     輪回自己開新墩)。
+        #   - 跟牌(control=0)：桌上有牌且是「別家」打的 → 必須壓過。
+        # 註:lead_actor 實測在自己跟牌時仍回報 "self"(較像本局領頭/莊家,非當墩控制者),
+        #     用它會把跟牌誤判成自由出牌 → MCTS 去搜葫蘆跟單張(舊 bug)。改用 last_played_by。
+        self.control = 1 if (not last_played or last_played_by == "self") else 0
         self.playersGo = self._SEAT.get(obs.get("turn", "self"), 1)
 
         # mustPlayClub3: 3♣ = card_id 1 must be in legal play
@@ -761,6 +762,7 @@ def _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, 
                       for a in np.argsort(pol)[::-1][:5] if pol[a] > 0.01]
         c = obs.get("constraint", {})
         to_beat = [_cid_label(_bv_to_id(card["code"])) for card in c.get("last_played_cards", [])]
+        mcts_arg = int(np.argmax(vis)) if vis.sum() > 0 else int(action)
         rec = {
             "ts": _dt.datetime.now().isoformat(timespec="seconds"),
             "game_index": obs.get("game_index"),
@@ -776,6 +778,10 @@ def _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, 
             "mcts_top": mcts_top,
             "policy_top": policy_top,
             "chosen": _action_cards(int(action)),
+            "mcts_argmax": _action_cards(mcts_arg),
+            "salvaged": bool(mcts_arg != int(action)),  # True = MCTS 首選沒被打出(obs_mask/一張牌規則覆寫)
+            "last_played_by": c.get("last_played_by"),
+            "lead_actor": c.get("lead_actor"),
         }
         os.makedirs(os.path.dirname(_MCTS_LOG_PATH), exist_ok=True)
         with open(_MCTS_LOG_PATH, "a") as f:
@@ -826,12 +832,13 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
 
     c = obs.get("constraint", {})
     last_played = c.get("last_played_cards", [])
-    lead_actor  = c.get("lead_actor")
+    last_played_by = c.get("last_played_by")
 
-    # 跟牌 iff 桌上有牌且非自己主導(只有 lead_actor==self 才是自己開的墩)。
+    # 跟牌 iff 桌上有牌且那張牌是「別家」打的(last_played_by != self)。
     # 跟牌時務必把「桌上要壓的牌」設進 env(handsPlayed),否則 MCTS 會誤以為在自由
-    # 開牌、去搜不合法的領牌手 → 真正的跟牌決策沒被搜到(舊 bug:用 lead_actor is None)。
-    if last_played and lead_actor != "self":
+    # 開牌、去搜不合法的領牌手(葫蘆跟單張)→ 真正的跟牌決策沒被搜到。
+    # (lead_actor 在跟牌時仍回報 self,不可靠;改用 last_played_by。)
+    if last_played and last_played_by != "self":
         g.control = 0
         last_card_ids = sorted(_bv_to_id(card["code"]) for card in last_played)
         if g.goIndex == 0:
