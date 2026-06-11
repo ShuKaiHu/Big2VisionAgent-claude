@@ -776,16 +776,50 @@ def _build_seat_map(self_index: str | None) -> dict[str, str]:
 
 
 def _apply_relative_seat_labels(events: list[dict[str, object]]) -> None:
-    self_index = None
-    for event in events:
-        if event.get("command") == "play" and event.get("event") == "hand_snapshot":
-            actor_index = event.get("actor_index")
-            if isinstance(actor_index, str):
-                self_index = actor_index
-                break
+    # Seat labels are RELATIVE to our seat index, and our index CHANGES when we
+    # re-enter a table between games (observed 0→2→3 within one session). A
+    # single session-wide map therefore rotates every actor label for games
+    # played at a different seat (self plays logged as "top", opponents' as
+    # "self" → corrupted play_history/cardsPlayed/control and the dashboard's
+    # untracked-card warnings).
+    #
+    # The map must switch at TABLE boundaries, not at the hand snapshot itself:
+    # the new table's first plays can arrive BEFORE our hand snapshot (observed:
+    # a 5-card opening two events before the snapshot). So when a snapshot
+    # reveals a NEW index, the new map applies retroactively from just after
+    # the last COMPLETED game (its 4th show_score) — everything between game
+    # boundaries belongs to one table and gets one consistent map.
+    snaps = [
+        (i, event.get("actor_index"))
+        for i, event in enumerate(events)
+        if event.get("command") == "play" and event.get("event") == "hand_snapshot"
+        and isinstance(event.get("actor_index"), str)
+    ]
+    game_ends = []  # position of each game's 4th show_score
+    n_scores = 0
+    for i, event in enumerate(events):
+        if event.get("event") == "show_score":
+            n_scores += 1
+            if n_scores % 4 == 0:
+                game_ends.append(i)
 
-    seat_map = _build_seat_map(self_index)
-    for event in events:
+    # (start_position, self_index, seat_map) — active from start_position onward
+    change_points: list[tuple[int, str, dict[str, str]]] = []
+    active_index = None
+    for pos, idx in snaps:
+        if idx != active_index:
+            ends_before = [p for p in game_ends if p < pos]
+            start = (ends_before[-1] + 1) if ends_before else 0
+            change_points.append((start, idx, _build_seat_map(idx)))
+            active_index = idx
+
+    seat_map: dict[str, str] = {}
+    self_index = None
+    next_cp = 0
+    for i, event in enumerate(events):
+        while next_cp < len(change_points) and i >= change_points[next_cp][0]:
+            _, self_index, seat_map = change_points[next_cp]
+            next_cp += 1
         actor_index = event.get("actor_index")
         if isinstance(actor_index, str):
             event["actor"] = seat_map.get(actor_index, actor_index)
