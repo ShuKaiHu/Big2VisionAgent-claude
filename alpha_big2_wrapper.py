@@ -59,17 +59,20 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Online void-constrained determinization (opt-in, default OFF) ────────────
-# When an opponent passes while a SINGLE leads the trick, a rational player
-# reveals it holds no single higher than that card. We accumulate this as a hard
-# cap on the opponent's max card_id and exclude higher cards when sampling
-# opponent hands for MCTS determinization. This is a RATIONAL-PLAY assumption
-# (humans sometimes pass while saving a high card), so it is gated behind
-# BIG2_VOID=1 and MUST be A/B-validated online — if it hurts (as the soft belief
-# experiment did), leave it off. Default OFF keeps V6 deployment byte-identical.
-_VOID_ON = os.environ.get("BIG2_VOID") == "1"
-if _VOID_ON:
-    log.info("BIG2_VOID=1 → void-constrained determinization ENABLED")
+# ── Graded-confidence world sampler v2 (default ON; BIG2_VOID=0 disables) ────
+# Pass-derived constraints are BEHAVIORAL, not logic: an opponent may hoard a 2
+# rather than beat a 9. Each pass therefore yields a constraint with a measured
+# confidence p (mined from 4,006 events in our own logs, NOTES_V9_design
+# 2026-06-12): passing on a small single is ~76% strategic (near-useless signal)
+# while passing with <=3 cards left is ~95% honest. Per sampled world each
+# constraint activates with probability p (Bernoulli) so the world ensemble
+# carries the right proportion of "he's hoarding" hypotheses. Single-card caps
+# filter at deal time; pair/5-card constraints are combinatorial (every card
+# individually legal, the combination not) and are verified post-deal with
+# generate-and-test rejection. Disable with BIG2_VOID=0 for A/B.
+_VOID_ON = os.environ.get("BIG2_VOID") != "0"
+if not _VOID_ON:
+    log.info("BIG2_VOID=0 → world sampler constraints DISABLED (uniform worlds)")
 
 # ── Model loading ────────────────────────────────────────────────────────────
 _CKPT_DIR = os.path.join(_AB2_DIR, "engine", "checkpoints")
@@ -224,9 +227,13 @@ class MockGame:
         self.gameOver: int = 0
         self.rewards: np.ndarray = np.zeros(4)
         self._prev_constraint = {}
-        # BIG2_VOID: per-opponent max card_id they can hold, inferred from passes
-        # on a single lead. 52 = no constraint (no informative pass yet).
+        # Legacy v1 summary: per-opponent max card_id, inferred from passes on a
+        # single lead. 52 = no constraint. (v2 uses pass_constraints below.)
         self.opp_void_single_cap: dict[int, int] = {p: 52 for p in range(2, 5)}
+        # Sampler v2: graded-confidence pass constraints, rebuilt each turn from
+        # play_history. Each = {"seat": 2-4, "table": tuple(card_ids of the hand
+        # the seat passed on), "p": measured confidence the pass was honest}.
+        self.pass_constraints: list[dict] = []
         # Authoritative-rebuild bookkeeping (play_history path):
         self._logged_events: int = 0      # play_history entries already turned into dashboard events
         self._last_lead_single: int | None = None  # card_id of the current trick's leading single (void)
@@ -307,7 +314,11 @@ class MockGame:
         self.passedThisRound = {p: False for p in range(1, 5)}
         self.lastPlayedPlayer = 1
         self.opp_void_single_cap = {p: 52 for p in range(2, 5)}
+        self.pass_constraints = []
         self._last_lead_single = None
+        last_table: tuple | None = None      # cards of the play currently on the table
+        played_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+        seen_constraints: set = set()
 
         for ev in play_history:
             actor = ev.get("actor")
@@ -336,6 +347,8 @@ class MockGame:
                 # New hand on the table → everyone's pass-flag resets.
                 self.passedThisRound = {q: False for q in range(1, 5)}
                 self._last_lead_single = card_ids[0] if len(card_ids) == 1 else None
+                last_table = tuple(card_ids)
+                played_counts[p] = played_counts.get(p, 0) + len(card_ids)
             else:  # pass
                 self.goIndex += 1
                 self.actionHistory.append({
@@ -347,13 +360,24 @@ class MockGame:
                     "passed_snapshot": snap,
                 })
                 self.passedThisRound[p] = True
-                # Void: passing on a single reveals no single stronger than it.
-                # cap 一律計算（供看板 belief 估計用），是否套用到 MCTS 抽樣才看
-                # _VOID_ON（_sample_opponent_hands）。兩者解耦：看板的對手手牌信心
-                # 總是用得到 void 資訊，MCTS 行為維持原樣。
+                # Legacy v1 cap (kept for compatibility/diagnostics).
                 if (p != 1 and self._last_lead_single is not None
                         and self._last_lead_single < self.opp_void_single_cap[p]):
                     self.opp_void_single_cap[p] = self._last_lead_single
+                # Sampler v2: graded-confidence constraint — this seat passed on
+                # `last_table` while holding `13 - played` cards. Confidence p is
+                # the measured probability the pass was honest ("cannot beat"),
+                # NOT a hard void (he may be hoarding a 2 over a 9).
+                if p != 1 and last_table is not None:
+                    rem_now = 13 - played_counts.get(p, 0)
+                    key = (p, last_table)
+                    if rem_now > 0 and key not in seen_constraints:
+                        seen_constraints.add(key)
+                        self.pass_constraints.append({
+                            "seat": p,
+                            "table": last_table,
+                            "p": _pass_confidence(last_table, rem_now),
+                        })
         # 看板事件紀錄改由 dashboard_writer.build_events 直接從 play_history 算
         # （main.py 與 wrapper 共用，完整且一致），此處不再另行累積。
 
@@ -423,13 +447,55 @@ class MockGame:
 
 # ── Determinization helpers ───────────────────────────────────────────────────
 
-def _assign_with_void(mock_game: "MockGame", remaining: list, sizes: dict) -> dict[int, np.ndarray]:
+def _pass_confidence(table_cards, passer_remaining: int) -> float:
+    """P(這次 pass 真的代表「壓不過」), 依 (被 pass 的牌 × pass 者當時剩牌數)。
+    單張數字從自家牌局實測(4,006 事件, NOTES_V9_design 2026-06-12):
+    對小單張 pass 76% 是藏牌(訊號近乎無用)、殘局(剩≤3) pass 95% 誠實。
+    對子/五張暫用保守先驗,之後同法挖掘校準。"""
+    n = len(table_cards)
+    if n == 1:
+        rank = (max(table_cards) - 1) // 4 + 1   # 1=3 … 13=2
+        if rank <= 6:        # 3-8
+            p = 0.25
+        elif rank <= 10:     # 9-Q
+            p = 0.70
+        else:                # K/A/2
+            p = 0.90
+    elif n == 2:
+        p = 0.75
+    else:
+        p = 0.80
+    if passer_remaining <= 3:
+        p = min(0.95, p + 0.15)
+    elif passer_remaining >= 8:
+        p = max(0.20, p - 0.10)
+    return p
+
+
+def _hand_can_beat(hand_ids, table_ids) -> bool:
+    """`hand` 是否存在能壓過 `table` 的合法出牌 — 完全以引擎
+    (big2Game.returnAvailableActions)為準,不重寫任何比較邏輯。
+    重要:此規則集的四條/同花順可壓「任何」牌型(含單張、對子),手寫
+    fast path 會漏掉(實測抓到 4444 壓對8、♣A2345 同花順壓對8)。
+    引擎 valid-actions 是 MCTS 每個節點都在跑的熱路徑,夠快。"""
+    g = big2Game.__new__(big2Game)
+    g.currentHands = {1: np.array(sorted(int(c) for c in hand_ids), dtype=np.int64)}
+    g.playersGo = 1
+    g.control = 0
+    g.goIndex = 2
+    g.handsPlayed = {1: MockGame._H(sorted(int(c) for c in table_ids))}
+    g.passedThisRound = {1: False, 2: False, 3: False, 4: False}
+    mask = g.returnAvailableActions()
+    mask[enumerateOptions.passInd] = 0.0
+    return bool(mask.sum() > 0)
+
+
+def _assign_with_void(caps: dict, remaining: list, sizes: dict) -> dict[int, np.ndarray]:
     """Partition `remaining` (already shuffled) to opponents 2/3/4 respecting
-    per-seat void caps (max card_id from passes on a single). Tightest cap first;
-    if a seat cannot be filled from eligible cards, take all eligible and fill
-    the shortfall from the rest (relaxing the cap) so determinization never fails.
-    With all caps = 52 this reduces to a uniform random partition (== no-void)."""
-    caps = mock_game.opp_void_single_cap
+    per-seat single-card caps (max card_id). Tightest cap first; if a seat
+    cannot be filled from eligible cards, take all eligible and fill the
+    shortfall from the rest (relaxing the cap) so determinization never fails.
+    With all caps = 52 this reduces to a uniform random partition."""
     pool = [int(c) for c in remaining]
     opp_hands: dict[int, np.ndarray] = {}
     for p in sorted([2, 3, 4], key=lambda q: caps.get(q, 52)):  # tightest first
@@ -453,6 +519,41 @@ def _assign_with_void(mock_game: "MockGame", remaining: list, sizes: dict) -> di
         opp_hands[p] = np.array(sorted(chosen_set), dtype=np.int64)
         pool = [c for c in pool if c not in chosen_set]
     return opp_hands
+
+
+_REJECT_TRIES = 12   # generate-and-test budget per world
+
+
+def _assign_world(mock_game, pool: list, sizes: dict,
+                  k_reject: int = _REJECT_TRIES) -> dict[int, np.ndarray]:
+    """世界採樣器 v2:每個世界 —
+    ① 各約束以其信心 p 擲骰啟用(Bernoulli)→ 世界群自然含正確比例的「他在藏牌」假設
+    ② 啟用的單張約束 → 發牌時 cap 過濾(精確)
+    ③ 啟用的對子/五張約束 → 發完牌對「完整手牌」驗證(組合型無法用單張排除表達:
+       4/5/6/7/8 每張都合法,湊成 45678 才違規)→ 違反整副重抽
+    ④ 重抽 k_reject 次仍不滿足 → 用「違反最少」的備胎(絕不卡死出牌)"""
+    constraints = (getattr(mock_game, "pass_constraints", None) or []) if _VOID_ON else []
+    active = [c for c in constraints if np.random.rand() < c["p"]]
+    caps = {2: 52, 3: 52, 4: 52}
+    combo = []
+    for c in active:
+        if len(c["table"]) == 1:
+            caps[c["seat"]] = min(caps[c["seat"]], int(c["table"][0]))
+        else:
+            combo.append(c)
+    best = None
+    best_viol = 10 ** 9
+    for _ in range(max(1, int(k_reject))):
+        remaining = list(pool)
+        np.random.shuffle(remaining)
+        hands = _assign_with_void(caps, remaining, sizes)
+        viol = sum(1 for c in combo
+                   if _hand_can_beat(hands.get(c["seat"], []), c["table"]))
+        if viol == 0:
+            return hands
+        if viol < best_viol:
+            best, best_viol = hands, viol
+    return best
 
 
 def _sample_opponent_hands(mock_game: MockGame) -> dict[int, np.ndarray]:
@@ -494,17 +595,9 @@ def _sample_opponent_hands(mock_game: MockGame) -> dict[int, np.ndarray]:
     # 直接 cap 到 13 即可保持安全（Big2 任何玩家最多持 13 張）。
     sizes = {p: min(13, sizes[p]) for p in [2, 3, 4]}
 
-    if _VOID_ON:
-        opp_hands = _assign_with_void(mock_game, remaining, sizes)
-    else:
-        opp_hands = {}
-        offset = 0
-        for p in [2, 3, 4]:
-            n = sizes[p]
-            opp_hands[p] = np.array(
-                sorted(remaining[offset : offset + n]), dtype=np.int64
-            )
-            offset += n
+    # Sampler v2: graded-confidence constraints + rejection. With BIG2_VOID=0
+    # (or no constraints yet) this reduces to a uniform random partition.
+    opp_hands = _assign_world(mock_game, remaining, sizes)
 
     total_needed = sum(sizes[p] for p in [2, 3, 4])
     if total_needed > len(remaining):
@@ -549,10 +642,10 @@ def _estimate_belief(mock_game: MockGame, n_samples: int = 120):
     counts = {cid: {2: 0, 3: 0, 4: 0} for cid in unknown}
     runs = 0
     for _ in range(n_samples):
-        remaining = list(unknown)
-        np.random.shuffle(remaining)
         try:
-            hands = _assign_with_void(mock_game, remaining, sizes)
+            # 與 MCTS 決策用同一個 v2 採樣器(顯示 = 決策心中世界的平均);
+            # 顯示用較小的拒絕預算,控制看板更新成本。
+            hands = _assign_world(mock_game, unknown, sizes, k_reject=3)
         except Exception:
             continue
         for p in (2, 3, 4):
