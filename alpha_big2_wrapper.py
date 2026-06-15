@@ -109,7 +109,7 @@ def _load_model() -> Big2Net:
     # encode_static, so the build width + feature vector match the checkpoint.
     import engine.features as _f
     if ckpt_in is not None:
-        _f.set_combo((ckpt_in - _f.GRU_HIDDEN) >= 302 + 4 + 8)
+        _f.set_combo((ckpt_in - _f.GRU_HIDDEN) >= 302 + 4 + 6)
         if _f.COMBO_ON:
             log.info("Combo features ON (V9b) → STATIC_DIM=%d", _f.STATIC_DIM)
     model = Big2Net()
