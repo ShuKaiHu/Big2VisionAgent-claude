@@ -83,11 +83,11 @@ torch.set_num_threads(4)
 torch.set_num_interop_threads(4)
 
 def _load_model() -> Big2Net:
-    model = Big2Net()
     # ALPHA_BIG2_CKPT lets you A/B a non-default checkpoint online without
     # touching best.pt. Accepts an absolute path OR a name relative to _CKPT_DIR
-    # (e.g. "saved/v8_td_deploy.pt"). Unset → default best.pt (V6). Both V6 and
-    # V8 are 306-dim — dominance is baked in (default ON), so NO flag is needed.
+    # (e.g. "saved/v8_td_deploy.pt"). Unset → default best.pt. Dominance is baked
+    # in (306-dim); V9b adds 8 combo features (314-dim) — both auto-detected from
+    # the checkpoint width below, so NO flag is needed.
     _override = os.environ.get("ALPHA_BIG2_CKPT")
     if _override:
         path = _override if os.path.isabs(_override) else os.path.join(_CKPT_DIR, _override)
@@ -97,17 +97,26 @@ def _load_model() -> Big2Net:
         path = _BEST_PT if os.path.exists(_BEST_PT) else _LATEST_PT
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt["model_state"] if "model_state" in ckpt else ckpt
-    # ── Feature-dim safety guard ───────────────────────────────────────────
-    # A model trained with dominance features (baked in, STATIC_DIM 306)
-    # has a 434-wide input_proj; a 302-dim build is 430-wide. load_state_dict
-    # with strict=False would SILENTLY DROP the mismatched input layer, leaving
-    # it randomly initialized → the model plays garbage with NO error. Detect
-    # this and fail LOUDLY with the fix instead.
+    # Detect input width BEFORE building the model.
     ckpt_in = None
     for k in ("input_proj.0.weight", "input_proj.weight"):
         if k in state:
             ckpt_in = state[k].shape[1]
             break
+    # V9b: auto-enable combo-structure features if the checkpoint expects the
+    # wider input (314 static = 302 base + 4 dominance + 8 combo → 442 with GRU).
+    # set_combo() must run BEFORE Big2Net()/Big2ValueNet() and before any
+    # encode_static, so the build width + feature vector match the checkpoint.
+    import engine.features as _f
+    if ckpt_in is not None:
+        _f.set_combo((ckpt_in - _f.GRU_HIDDEN) >= 302 + 4 + 8)
+        if _f.COMBO_ON:
+            log.info("Combo features ON (V9b) → STATIC_DIM=%d", _f.STATIC_DIM)
+    model = Big2Net()
+    # ── Feature-dim safety guard ───────────────────────────────────────────
+    # load_state_dict(strict=False) would SILENTLY DROP a mismatched input layer,
+    # leaving it randomly initialized → the model plays garbage with NO error.
+    # Detect and fail LOUDLY instead.
     model_in = model.input_proj[0].weight.shape[1]
     if ckpt_in is not None and ckpt_in != model_in:
         import engine.features as _f
