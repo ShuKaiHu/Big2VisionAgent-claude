@@ -82,6 +82,11 @@ _LATEST_PT = os.path.join(_CKPT_DIR, "latest.pt")
 torch.set_num_threads(4)
 torch.set_num_interop_threads(4)
 
+_CKPT_TAG = "?"   # set by _load_model(); recorded into every mcts_moves row so
+                  # the analysis can ALWAYS tell which model produced a batch
+                  # (twice we've online-tested the wrong model by forgetting
+                  # ALPHA_BIG2_CKPT — never again).
+
 def _load_model() -> Big2Net:
     # ALPHA_BIG2_CKPT lets you A/B a non-default checkpoint online without
     # touching best.pt. Accepts an absolute path OR a name relative to _CKPT_DIR
@@ -147,6 +152,10 @@ def _load_model() -> Big2Net:
         value_model.load_state_dict(ckpt["value_state"])
         value_model.eval()
         log.info("Full-info value net loaded (V9) → multi-determinization MCTS")
+    global _CKPT_TAG
+    _CKPT_TAG = (f"{os.path.basename(path)}:s{model_in - 128}"
+                 f"{'+v' if value_model is not None else ''}")
+    log.info("CKPT_TAG = %s", _CKPT_TAG)
     return model, value_model
 
 _model, _value_model = _load_model()
@@ -887,6 +896,7 @@ def _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, 
         mcts_arg = int(np.argmax(vis)) if vis.sum() > 0 else int(action)
         rec = {
             "ts": _dt.datetime.now().isoformat(timespec="seconds"),
+            "ckpt": _CKPT_TAG,   # which model produced this move (attribution)
             "game_index": obs.get("game_index"),
             "control": "lead" if mock_game.control == 1 else "follow",
             "my_hand": [_cid_label(x) for x in sorted(int(c) for c in mock_game.currentHands[1])],
