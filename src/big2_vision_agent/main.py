@@ -5,6 +5,8 @@ import asyncio
 import json
 import os
 import random
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -41,6 +43,10 @@ from big2_vision_agent.network_parser import (
     summarize_turns,
 )
 from big2_vision_agent.ml_state import build_ml_state
+from big2_vision_agent import dashboard_writer
+
+# 看板狀態檔（與 alpha_big2_wrapper.py 的 _DASH_STATE_PATH 同一路徑）
+_DASH_STATE_PATH = str(Path(__file__).resolve().parent.parent.parent / "state" / "dashboard_state.json")
 
 DEFAULT_QUICK_PLAY_X = 885.0
 DEFAULT_QUICK_PLAY_Y = 948.0
@@ -1431,6 +1437,18 @@ async def _build_live_observation(page, runtime_state: dict):
     return build_live_agent_observation(timeline, runtime_state), parsed_events, timeline
 
 
+async def _update_dashboard_live(page, runtime_state: dict, logger) -> None:
+    """對手回合即時推進看板牌況（四家牌況 + 事件紀錄 + 桌面 + 輪到誰）。
+
+    wrapper 只在輪到我時被呼叫，對手出牌/PASS 時看板靠這裡更新。AI 決策選項與
+    對手推測手牌算不出來，write_live 會保留 wrapper 上次寫入的那些區塊。"""
+    try:
+        observation, _, _ = await _build_live_observation(page, runtime_state)
+        dashboard_writer.write_live(_DASH_STATE_PATH, observation.model_dump())
+    except Exception as exc:  # 看板更新失敗絕不可影響對局主流程
+        logger.log(f"dashboard live update skipped: {exc}")
+
+
 async def _read_timeline(page):
     """Fetch the current WS-derived game timeline (round_result events carry the
     authoritative SERVER scores, unlike the Cocos-derived hand counts)."""
@@ -2604,6 +2622,10 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                         state = await clear_selected_cards(page, state, action_log, logger)
                     # Check finish3 every ~2 s of idle time (throttled; for logging only)
                     idle_poll_count += 1
+                    # 對手回合也即時更新看板牌況（每 2 次 poll ≈ 360 ms）。
+                    # wrapper 只在輪到我時被呼叫，對手出牌時要靠這裡推進看板。
+                    if idle_poll_count % 2 == 0:
+                        await _update_dashboard_live(page, state, logger)
                     if idle_poll_count % 11 == 0:  # 11 × 180 ms ≈ 2 s
                         await _check_finish3()
                     await page.wait_for_timeout(IDLE_POLL_MS)
@@ -2717,7 +2739,24 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     last_failed_signature = None
                     skip_count = 0
                     play_fail_count = 0
-                elif result.get("reason") == "play_not_confirmed":
+                    # ── Block until our turn actually ends ─────────────────────
+                    # Right after our own play the Cocos UI still reports our turn
+                    # as actionable for a few hundred ms before the server passes
+                    # control. A stateless / instant decision agent (the built-in
+                    # fallback) races straight back into the loop and plays AGAIN
+                    # out-of-turn → the game rejects it ("牌型錯誤") and the
+                    # executor reports play_confirmation_timeout. (The ML wrapper
+                    # only hid this because its ~1 s search let the UI settle.)
+                    # You can never legally act twice in a row in Big 2, so wait
+                    # (bounded) until the turn leaves us, so the next decision
+                    # lands on a real turn instead of a stale "still my turn".
+                    if decision.action == "play":
+                        for _ in range(12):  # ≤ ~2.6 s (12 × POST_ACTION_WAIT_MS)
+                            await page.wait_for_timeout(POST_ACTION_WAIT_MS)
+                            settle_state = await read_big2_game_state(page)
+                            if not is_self_actionable_turn(settle_state):
+                                break
+                elif result.get("reason") in ("play_not_confirmed", "play_confirmation_timeout"):
                     play_fail_count += 1
                     if decision_signature != last_failed_signature:
                         skip_count = 0
@@ -2807,6 +2846,51 @@ async def run_lobby_wait(settings: Settings) -> None:
         print(f"Scene tree saved: {scene_tree_path}")
 
 
+def _launch_dashboard_window() -> None:
+    """啟動 HTML 看板伺服器（背景）並開啟瀏覽器。"""
+    import atexit, socket, time, webbrowser
+
+    project_dir = Path(__file__).resolve().parent.parent.parent
+    dashboard   = project_dir / "dashboard" / "game_dashboard.py"
+    port = 7373
+    url  = f"http://localhost:{port}"
+
+    if not dashboard.exists():
+        print(f"[dashboard] 找不到 {dashboard}，略過")
+        return
+
+    # 若同 port 已有伺服器，直接開瀏覽器即可
+    try:
+        s = socket.create_connection(("localhost", port), timeout=0.3)
+        s.close()
+        webbrowser.open(url)
+        print(f"[dashboard] 看板已開啟：{url}")
+        return
+    except OSError:
+        pass
+
+    # 啟動看板伺服器（跟著主程式一起結束）
+    proc = subprocess.Popen(
+        [sys.executable, str(dashboard), "--port", str(port)],
+        cwd=str(project_dir),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(proc.terminate)
+
+    # 等待伺服器就緒（最多 3 秒）
+    for _ in range(30):
+        try:
+            s = socket.create_connection(("localhost", port), timeout=0.1)
+            s.close()
+            break
+        except OSError:
+            time.sleep(0.1)
+
+    webbrowser.open(url)
+    print(f"[dashboard] 看板已開啟：{url}  (PID {proc.pid})")
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -2891,6 +2975,7 @@ def main() -> None:
         asyncio.run(run_autoplay_random(settings, args.timeout_seconds, args.record_video))
         return
     if args.command == "autoplay-agent":
+        _launch_dashboard_window()
         asyncio.run(run_autoplay_agent(settings, args.timeout_seconds, args.record_video, args.executor, args.games))
         return
     if args.command == "lobby-wait":
