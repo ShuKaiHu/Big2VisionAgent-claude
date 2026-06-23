@@ -2068,6 +2068,14 @@ async def ensure_game_scene_from_lobby(
         logger.log(f"enter_game attempt={attempt} wait_for_game_scene -> {scene}")
         if scene == "GameScene":
             return page, scene
+        # Bounce diagnosis: capture the lobby so we can tell an unrecognized ad
+        # popup apart from a genuinely empty/no-match lobby.
+        try:
+            shot = logger.path.parent / f"lobby_bounce_attempt{attempt}.png"
+            await page.screenshot(path=str(shot), full_page=True)
+            logger.log(f"enter_game attempt={attempt} bounce screenshot -> {shot.name}")
+        except Exception as _shot_err:
+            logger.log(f"enter_game attempt={attempt} bounce screenshot failed: {_shot_err}")
         # Failed to enter game — clear any popup that might have appeared
         # (e.g. "房間已滿") and wait before the next attempt.
         if attempt < attempts:
@@ -2739,22 +2747,26 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     last_failed_signature = None
                     skip_count = 0
                     play_fail_count = 0
-                    # ── Block until our turn actually ends ─────────────────────
-                    # Right after our own play the Cocos UI still reports our turn
-                    # as actionable for a few hundred ms before the server passes
-                    # control. A stateless / instant decision agent (the built-in
-                    # fallback) races straight back into the loop and plays AGAIN
-                    # out-of-turn → the game rejects it ("牌型錯誤") and the
-                    # executor reports play_confirmation_timeout. (The ML wrapper
-                    # only hid this because its ~1 s search let the UI settle.)
-                    # You can never legally act twice in a row in Big 2, so wait
-                    # (bounded) until the turn leaves us, so the next decision
-                    # lands on a real turn instead of a stale "still my turn".
+                    # ── Brief settle after our own play ────────────────────────
+                    # Right after our play the Cocos UI still reports our turn as
+                    # actionable for a few hundred ms before the server updates. A
+                    # stateless / instant agent (the built-in fallback) would race
+                    # back and fire a DUPLICATE decision on the stale state → the
+                    # game rejects it ("牌型錯誤") / play_confirmation_timeout.
+                    # Wait until the turn leaves us — BUT break immediately if it
+                    # stays ours as a fresh LEAD (winning a trick = all others
+                    # passed = we act again right away; the pass button goes
+                    # inactive when we lead). Without that check we used to stall
+                    # the full budget every time we won a trick. Short cap keeps
+                    # it from ever feeling like a hang.
                     if decision.action == "play":
-                        for _ in range(12):  # ≤ ~2.6 s (12 × POST_ACTION_WAIT_MS)
+                        for _ in range(3):  # ≤ ~0.66 s (3 × POST_ACTION_WAIT_MS)
                             await page.wait_for_timeout(POST_ACTION_WAIT_MS)
                             settle_state = await read_big2_game_state(page)
                             if not is_self_actionable_turn(settle_state):
+                                break
+                            pass_btn = settle_state.get("action_buttons", {}).get("pass", {})
+                            if not pass_btn.get("active"):  # our turn again as a fresh lead
                                 break
                 elif result.get("reason") in ("play_not_confirmed", "play_confirmation_timeout"):
                     play_fail_count += 1
