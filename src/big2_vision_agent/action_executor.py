@@ -471,13 +471,27 @@ async def execute_packet_decision(
         after = await read_big2_game_state(page)
         confirmation_states.append(_compact_packet_confirmation_state(after, decision))
         if _packet_play_confirmed(pre_state, after, decision):
+            # Diagnostic: the hand should shrink by EXACTLY the number of cards we
+            # intended. If it shrank by a different amount the confirmation passed
+            # on a loose 'hand_decreased' — almost always the game AUTO-PLAYED a
+            # different (usually 1-card) move because we were too slow / missed the
+            # turn. ok stays True (don't change retry behaviour), but surface the
+            # mismatch in `reason` so it shows up in run.log instead of hiding.
+            _bc = pre_state.get("my_hand_count")
+            _ac = after.get("my_hand_count")
+            _intended = len(decision.card_codes) if decision.card_codes else 0
+            _mismatch = (
+                isinstance(_bc, int) and isinstance(_ac, int)
+                and _intended > 0 and (_bc - _ac) != _intended
+            )
             return {
                 "ok": True,
                 "sent": True,
                 "action": "play",
                 "card_codes": decision.card_codes,
                 "ws_message": message,
-                "reason": None,
+                "reason": (f"count_mismatch:played{_bc - _ac}/intended{_intended}"
+                           "(likely game auto-play)") if _mismatch else None,
                 "state": after,
                 "state_before": pre_state,
                 "confirmation_states": confirmation_states,

@@ -2673,6 +2673,12 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                         await page.wait_for_timeout(3000)
                         continue
 
+                # Latency clock: from "our actionable turn is confirmed" to the
+                # executor finishing. If this approaches the game's turn timer the
+                # server will AUTO-PLAY for us (looks like "timeout, played a random
+                # single") — log it so slow moves are visible, not silent.
+                _turn_t0 = loop.time()
+
                 # ── Forced pass after consecutive play failures ────────────────
                 # If play_not_confirmed fired ≥ 2 times in a row (regardless of
                 # which card was tried), the game state is likely diverged or the
@@ -2742,7 +2748,12 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                         "result": result,
                     }
                 )
-                logger.log(f"Executor result: ok={result.get('ok')} reason={result.get('reason')}")
+                _turn_dt = loop.time() - _turn_t0
+                _slow = " ⚠️SLOW" if _turn_dt > 5.0 else ""
+                logger.log(
+                    f"Executor result: ok={result.get('ok')} reason={result.get('reason')} "
+                    f"latency={_turn_dt:.1f}s{_slow}"
+                )
                 if result.get("ok"):
                     last_failed_signature = None
                     skip_count = 0
