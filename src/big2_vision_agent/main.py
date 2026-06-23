@@ -2369,6 +2369,9 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
             in_scoring_wait: bool = False   # True after a game ends, until fresh cards dealt
             last_decline_time: float = 0.0  # throttle decline calls (avoid log spam)
             play_fail_count: int = 0    # consecutive play_not_confirmed; triggers forced pass
+            _last_acted_hand: int | None = None  # our hand count as of last sync; if it DROPS
+                                        # while it's not our turn, the server auto-played for us
+                                        # (turn missed) — caught even though no executor ran.
             game_results: list[dict] = []   # per-game results for this run
 
             # Persistent results log: all runs append to the same file so
@@ -2625,6 +2628,20 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     continue
 
                 if not is_self_actionable_turn(state):
+                    # Turn-miss / server auto-play detector: when it is NOT our
+                    # turn our hand must stay constant (only opponents act). If it
+                    # SHRANK since last sync, the server played for us — the
+                    # "turn came, timeout, random single" case, which leaves no
+                    # executor record. Flag it loudly, then resync.
+                    _cur_hc = state.get("my_hand_count")
+                    if isinstance(_cur_hc, int):
+                        if (_last_acted_hand is not None and _cur_hc < _last_acted_hand
+                                and not in_scoring_wait):
+                            logger.log(
+                                f"⚠️ AUTO-PLAY DETECTED: our hand {_last_acted_hand}->{_cur_hc} "
+                                f"with NO agent decision (server timed us out / turn missed)"
+                            )
+                        _last_acted_hand = _cur_hc
                     if state.get("my_selected_count", 0) > 0:
                         logger.log("Clearing stale selection outside my actionable turn")
                         state = await clear_selected_cards(page, state, action_log, logger)
@@ -2758,6 +2775,11 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     last_failed_signature = None
                     skip_count = 0
                     play_fail_count = 0
+                    # Resync the turn-miss baseline to our post-action hand so our
+                    # OWN play isn't mistaken for a server auto-play next idle poll.
+                    _res_state = result.get("state") or {}
+                    if isinstance(_res_state.get("my_hand_count"), int):
+                        _last_acted_hand = _res_state["my_hand_count"]
                     # ── Brief settle after our own play ────────────────────────
                     # Right after our play the Cocos UI still reports our turn as
                     # actionable for a few hundred ms before the server updates. A
