@@ -1806,6 +1806,80 @@ async def maybe_clear_lobby_popup(page) -> bool:
     if cleared:
         return cleared
 
+    # --- Strategy 0b: reward / top-up promo dialog (恭喜獲得儲值好禮…) ---
+    # This dialog's close is an image X (no text label) so Strategy 0 misses it,
+    # and its node name isn't in the known lists. It carries a real-money
+    # "立即使用" top-up button, so we must dismiss WITHOUT ever touching that.
+    # Locate the dialog by its reward wording, then click the TOP-RIGHT-most
+    # cc.Button inside it (the X) — and HARD-EXCLUDE any button whose subtree
+    # contains a purchase label. Both the position rule and the label exclusion
+    # independently guarantee we never hit "立即使用". No-ops if not found.
+    try:
+        reward_result = await page.evaluate("""
+        (() => {
+            const cc = window.cc;
+            if (!cc || !cc.director) return null;
+            const scene = cc.director.getScene();
+            if (!scene) return null;
+            const REWARD_HINTS = ['恭喜', '好禮', '儲值好禮', '優惠', '獲得儲值'];
+            const PURCHASE_TEXTS = ['立即使用', '立即', '儲值', '充值', '購買', '購', 'NT$', '元'];
+
+            let dialog = null;
+            function findDialog(node) {
+                if (dialog || !node || !node.active) return;
+                const label = node.getComponent &&
+                    (node.getComponent('cc.Label') || node.getComponent(cc.Label));
+                if (label && typeof label.string === 'string' &&
+                        REWARD_HINTS.some(h => label.string.includes(h))) {
+                    let d = node;
+                    for (let i = 0; i < 6 && d.parent && d.parent !== scene; i++) d = d.parent;
+                    dialog = d; return;
+                }
+                for (const c of (node.children || [])) findDialog(c);
+            }
+            findDialog(scene);
+            if (!dialog) return null;
+
+            function hasPurchaseLabel(node) {
+                const lab = node.getComponent &&
+                    (node.getComponent('cc.Label') || node.getComponent(cc.Label));
+                if (lab && typeof lab.string === 'string' &&
+                        PURCHASE_TEXTS.some(t => lab.string.includes(t))) return true;
+                for (const c of (node.children || [])) if (hasPurchaseLabel(c)) return true;
+                return false;
+            }
+            const btns = [];
+            function collect(node) {
+                if (!node || !node.active) return;
+                const btn = node.getComponent &&
+                    (node.getComponent('cc.Button') || node.getComponent(cc.Button));
+                if (btn && Array.isArray(btn.clickEvents) && btn.clickEvents.length > 0
+                        && !hasPurchaseLabel(node)) {
+                    let wp = null;
+                    try { wp = node.convertToWorldSpaceAR(cc.v2(0, 0)); } catch (e) {}
+                    if (wp) btns.push({ node, x: wp.x, y: wp.y, btn });
+                }
+                for (const c of (node.children || [])) collect(c);
+            }
+            collect(dialog);
+            if (!btns.length) return null;
+            // Cocos y is up → top-right = max y, then max x.
+            btns.sort((a, b) => (b.y - a.y) || (b.x - a.x));
+            for (const eh of btns[0].btn.clickEvents) {
+                try { cc.Component.EventHandler.emitEvents([eh], { type: 'click' }); } catch (e) {}
+            }
+            return 'reward_dialog_closed';
+        })()
+        """)
+        if reward_result:
+            await asyncio.sleep(0.6)
+            cleared = True
+    except Exception:
+        pass
+
+    if cleared:
+        return cleared
+
     # --- Strategy 1: exact node names (confirmed via scene-dump) ---
     # Add new names here when new popup types are discovered.
     KNOWN_CLOSE_NODES = [
