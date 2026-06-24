@@ -2642,6 +2642,24 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                                 f"with NO agent decision (server timed us out / turn missed)"
                             )
                         _last_acted_hand = _cur_hc
+                    # Missed-turn root-cause probe: the screen says it's OUR turn
+                    # (turn==self) yet is_self_actionable_turn() returned False, so
+                    # the loop idles while the server clock runs down → timeout →
+                    # auto-play (the user's "our turn but waited to timeout"). Log
+                    # WHICH field failed so we can fix the parser, not guess.
+                    # Throttled to ~every 2 s so a real miss is visible w/o spam.
+                    if state.get("turn") == "self" and idle_poll_count % 11 == 0:
+                        _ab = state.get("action_buttons", {})
+                        _ctb = state.get("card_type_buttons") or {}
+                        logger.log(
+                            "⚠️ turn=self but NOT actionable — "
+                            f"clock_active={state.get('my_clock_active')} "
+                            f"play_btn={_ab.get('play', {}).get('active')} "
+                            f"pass_btn={_ab.get('pass', {}).get('active')} "
+                            f"cardtype_any_active="
+                            f"{any(isinstance(b, dict) and b.get('active') for b in _ctb.values())} "
+                            f"hand={state.get('my_hand_count')} selected={state.get('my_selected_count')}"
+                        )
                     if state.get("my_selected_count", 0) > 0:
                         logger.log("Clearing stale selection outside my actionable turn")
                         state = await clear_selected_cards(page, state, action_log, logger)
