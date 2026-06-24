@@ -91,38 +91,39 @@ class ExternalCommandAgent:
             pass
 
     def decide(self, observation: AgentObservation) -> AgentDecision | None:
-        self._ensure_process()
-        proc = self._process
-        assert proc is not None
-
-        # 寫入 observation（一行 JSON）
         line = json.dumps(observation.model_dump(), ensure_ascii=False) + "\n"
-        try:
-            proc.stdin.write(line)
-            proc.stdin.flush()
-        except BrokenPipeError:
-            log.error("[wrapper] stdin broken pipe — restarting process")
-            self._process = None
+        # The wrapper subprocess can die intermittently (observed: an OS SIGKILL
+        # -9 that is NOT this wrapper's own OOM — RSS stays ~190MB with the system
+        # mostly free). Rather than crash the whole autoplay session, RESTART the
+        # wrapper and retry the move ONCE. A fresh wrapper loses its in-memory
+        # MockGame history for this single move (slightly less accurate env
+        # reconstruction), but the session keeps playing instead of aborting; the
+        # following moves rebuild state normally.
+        for attempt in (1, 2):
             self._ensure_process()
             proc = self._process
-            proc.stdin.write(line)
-            proc.stdin.flush()
+            assert proc is not None
+            try:
+                proc.stdin.write(line)
+                proc.stdin.flush()
+                payload = proc.stdout.readline()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                log.error("[wrapper] write/read failed (%s) — restarting (attempt %d/2)",
+                          exc, attempt)
+                self._process = None
+                continue
+            if proc.poll() is not None:
+                log.error("[wrapper] exited unexpectedly (returncode=%s) — restarting (attempt %d/2)",
+                          proc.poll(), attempt)
+                self._process = None
+                continue
+            payload = payload.strip()
+            if not payload:
+                return None
+            return AgentDecision.model_validate_json(payload)
 
-        # 讀回 decision（一行 JSON）
-        try:
-            payload = proc.stdout.readline()
-        except Exception as exc:
-            raise RuntimeError(f"[wrapper] failed to read stdout: {exc}") from exc
-
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"[wrapper] process exited unexpectedly (returncode={proc.poll()})"
-            )
-
-        payload = payload.strip()
-        if not payload:
-            return None
-        return AgentDecision.model_validate_json(payload)
+        log.error("[wrapper] still unavailable after restart — skipping this decision")
+        return None
 
     def close(self) -> None:
         """關閉 wrapper process（agent 結束時呼叫）。"""
