@@ -1053,6 +1053,16 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
 
     _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, elapsed)
 
+    # Free the MCTS trees NOW. Each MCTSNode holds parent↔child references (a
+    # reference cycle) plus a cloned game env, so refcounting can't reclaim a tree
+    # when run() returns — it becomes cyclic garbage that only gc.collect() frees.
+    # With up to 4 determinization trees per move the cyclic garbage piles up far
+    # faster than the generational GC fires, climbing to multi-GB and getting the
+    # wrapper OOM-killed (SIGKILL -9) mid-session. One explicit collect per move
+    # (a few ms vs the ~1s search) keeps peak RSS flat.
+    import gc as _gc
+    _gc.collect()
+
     note = f"mcts:{n_sims}sims_{elapsed:.2f}s" + (f"_{_N_DETS}det" if _N_DETS > 1 else "")
     return action, note, extra
 
