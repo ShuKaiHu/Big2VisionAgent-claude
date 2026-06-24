@@ -2858,7 +2858,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     }
                 )
                 _turn_dt = loop.time() - _turn_t0
-                _slow = " ⚠️SLOW" if _turn_dt > 5.0 else ""
+                _slow = " ⚠️SLOW" if _turn_dt > 3.0 else ""
                 logger.log(
                     f"Executor result: ok={result.get('ok')} reason={result.get('reason')} "
                     f"latency={_turn_dt:.1f}s{_slow}"

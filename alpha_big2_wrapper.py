@@ -894,9 +894,15 @@ def _log_mcts_move(mock_game, obs, value, visits, policy_probs, action, n_sims, 
         c = obs.get("constraint", {})
         to_beat = [_cid_label(_bv_to_id(card["code"])) for card in c.get("last_played_cards", [])]
         mcts_arg = int(np.argmax(vis)) if vis.sum() > 0 else int(action)
+        try:
+            import resource as _res
+            _rss_mb = round(_res.getrusage(_res.RUSAGE_SELF).ru_maxrss / (1024 * 1024), 1)
+        except Exception:
+            _rss_mb = None
         rec = {
             "ts": _dt.datetime.now().isoformat(timespec="seconds"),
             "ckpt": _CKPT_TAG,   # which model produced this move (attribution)
+            "rss_mb": _rss_mb,   # wrapper peak memory — watch for a leak → SIGKILL(-9)
             "game_index": obs.get("game_index"),
             "control": "lead" if mock_game.control == 1 else "follow",
             "my_hand": [_cid_label(x) for x in sorted(int(c) for c in mock_game.currentHands[1])],
