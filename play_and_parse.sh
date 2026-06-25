@@ -26,12 +26,14 @@ export CARDAWARE_CKPT="$CKPT"
 if [ "$SEARCH" = "1" ]; then
   export CARDAWARE_SEARCH="1"; export CARDAWARE_BUDGET="${CARDAWARE_BUDGET:-1.0}"
 fi
-# BELIEF=1 -> belief-guided PIMC (importance-sample opponent hands from PPO_V6's
-# belief head instead of uniform). Needs SEARCH=1. This is the V6 deploy mode.
+# BELIEF=1 -> importance-sample opponent worlds from the dedicated BELIEF.pt.
+# VALUE=1  -> evaluate search leaves with VALUE.pt instead of full rollouts.
+# Both need SEARCH=1. The future main line = PPO_V4 + SEARCH=1 BELIEF=1 VALUE=1.
 if [ "${BELIEF:-0}" = "1" ]; then export BELIEF_SEARCH="1"; fi
+if [ "${VALUE:-0}" = "1" ];  then export VALUE_LEAF="1"; fi
 
 START=$(date +%s)
-echo "[play] $LABEL = $CKPT | search=$SEARCH | belief=${BELIEF:-0} | games=$GAMES"
+echo "[play] $LABEL = $CKPT | search=$SEARCH | belief=${BELIEF:-0} | value=${VALUE:-0} | games=$GAMES"
 uv run big2-agent autoplay-agent --executor packet --games "$GAMES" --timeout-seconds "${TIMEOUT:-2400}" || true
 
 echo "[parse] 記錄版本 + 累積真人資料集…"
