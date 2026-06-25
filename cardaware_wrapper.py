@@ -40,7 +40,7 @@ if _AB2PPO not in sys.path:
 
 from ppo.network_cardaware import CardAwareActorCritic, obs_from_env as ca_obs_from_env, _to_batch
 from ppo.action_features import ACTION_FEATURES
-from ppo.network_v6 import CardAwareV6, unseen_mask_from_obs
+from ppo.belief_model import BeliefNet, belief_from_obs
 from engine.env import Big2Env
 
 enumerateOptions = abw.enumerateOptions
@@ -65,13 +65,20 @@ _SEARCH_WORLDS = int(os.environ.get("CARDAWARE_WORLDS", "24"))   # hard cap (bou
 _SEARCH_TOPM = int(os.environ.get("CARDAWARE_TOPM", "4"))
 _SEARCH_BUDGET = float(os.environ.get("CARDAWARE_BUDGET", "1.0"))  # ~1s/move to fit the online turn timer
 
-# Belief-guided search (the V6 idea): instead of dealing opponents' unknown cards
-# UNIFORMLY at random for each PIMC world, importance-sample them from the V6
-# belief head P(opp holds card) — ~85% accurate on the human/online distribution.
-# The search then evaluates LIKELIER worlds. Policy/value/rollouts stay = _net.
+# ── Future main line: PPO_V4 (policy) + BELIEF.pt (belief) + VALUE.pt (value) ──
+# All three are HUMAN-DATA-grounded models. The search:
+#   BELIEF_SEARCH=1 → importance-sample each determinized world from the dedicated
+#     belief model BELIEF.pt (BeliefNet, 82.8% P@count on human data).
+#   VALUE_LEAF=1    → evaluate each candidate with the public-info value model
+#     VALUE.pt (truncated rollout to our next turn, then value) instead of rolling
+#     all the way to terminal with greedy.
+# Policy = whatever CARDAWARE_CKPT points to (set it to PPO_V4.pt at launch).
 _BELIEF_SEARCH = os.environ.get("BELIEF_SEARCH") == "1"
 _BELIEF_CKPT = os.environ.get(
-    "BELIEF_CKPT", os.path.join(_AB2PPO, "ppo", "checkpoints", "saved", "PPO_V6.pt"))
+    "BELIEF_CKPT", os.path.join(_AB2PPO, "ppo", "checkpoints", "saved", "BELIEF.pt"))
+_VALUE_LEAF = os.environ.get("VALUE_LEAF") == "1"
+_VALUE_CKPT = os.environ.get(
+    "VALUE_CKPT", "/Users/shukaihu/Code_Project_Local/AlphaBig2-Value/checkpoints/VALUE.pt")
 
 assert ACTION_FEATURES.shape[0] == enumerateOptions.passInd + 1, "action-space size mismatch"
 
@@ -95,11 +102,59 @@ log.info("cardaware loaded: %s (arch=%s upd=%s)", os.path.basename(_CKPT),
 _belief_net = None
 if _BELIEF_SEARCH:
     _bk = torch.load(_BELIEF_CKPT, map_location=_DEV, weights_only=False)
-    _belief_net = CardAwareV6().to(_DEV)
+    _belief_net = BeliefNet().to(_DEV)
     _belief_net.load_state_dict(_bk["model"])
     _belief_net.eval()
-    log.info("belief net loaded: %s (belief_prec=%s) — belief-guided search ON",
-             os.path.basename(_BELIEF_CKPT), _bk.get("belief_prec"))
+    log.info("belief net loaded: %s (val_pcount=%s) — belief-guided determinization ON",
+             os.path.basename(_BELIEF_CKPT), _bk.get("val_pcount"))
+
+
+# Public-info value model — mirror of AlphaBig2-Value/value_model.py ValueNet
+# (kept inline to avoid that workspace's import-time chdir). Leaf evaluator when
+# VALUE_LEAF=1: V(public state) -> expected final score for the to-move player.
+_VALUE_SCALE, _VD, _VE = 13.0, 64, 256
+
+
+class ValueNet(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.card_emb = torch.nn.Embedding(53, _VD, padding_idx=0)
+        self.hand_attn = torch.nn.MultiheadAttention(_VD, num_heads=4, batch_first=True)
+        _si = _VD + _VD + 3 * _VD + _VD + 3 + 1
+        self.enc = torch.nn.Sequential(
+            torch.nn.Linear(_si, _VE), torch.nn.ReLU(),
+            torch.nn.Linear(_VE, _VE), torch.nn.ReLU(),
+            torch.nn.Linear(_VE, _VE), torch.nn.ReLU(), torch.nn.LayerNorm(_VE))
+        self.value_head = torch.nn.Sequential(
+            torch.nn.Linear(_VE, _VE // 2), torch.nn.ReLU(),
+            torch.nn.Linear(_VE // 2, 1), torch.nn.Tanh())
+
+    def forward(self, obs):
+        hand_ids = obs["hand_ids"]; pad = hand_ids == 0
+        h = self.card_emb(hand_ids)
+        attn, _ = self.hand_attn(h, h, h, key_padding_mask=pad)
+        keep = (~pad).float().unsqueeze(-1)
+        hand_vec = (attn * keep).sum(1) / keep.sum(1).clamp(min=1.0)
+        cards = self.card_emb.weight[1:]
+        seen_vec = obs["seen"] @ cards
+        opp_vec = (obs["opp"] @ cards).reshape(obs["opp"].shape[0], -1)
+        trick_vec = obs["trick"] @ cards
+        si = torch.cat([hand_vec, seen_vec, opp_vec, trick_vec, obs["counts"], obs["passc"]], dim=-1)
+        return self.value_head(self.enc(si)).squeeze(-1)
+
+    @torch.no_grad()
+    def value_from_obs(self, st) -> float:
+        return float(self.forward(_to_batch([st], _DEV))[0].item()) * _VALUE_SCALE
+
+
+_value_net = None
+if _VALUE_LEAF:
+    _vk = torch.load(_VALUE_CKPT, map_location=_DEV, weights_only=False)
+    _value_net = ValueNet().to(_DEV)
+    _value_net.load_state_dict(_vk["model"])
+    _value_net.eval()
+    log.info("value net loaded: %s (val_mse=%s) — value-leaf eval ON",
+             os.path.basename(_VALUE_CKPT), _vk.get("val_mse"))
 
 
 class _EnvShim:
@@ -202,6 +257,21 @@ def _rollout(env) -> np.ndarray:
     return env.game.rewards
 
 
+@torch.no_grad()
+def _value_leaf(env, me) -> float:
+    """Leaf evaluation with the public-info VALUE.pt instead of a full rollout:
+    greedy-play opponents until it is `me`'s turn again (or terminal), then read the
+    value net from `me`'s perspective. Returns `me`'s expected final score (real
+    units), directly comparable to a terminal reward."""
+    steps = 0
+    while not env.done and env.current_player != me and steps < 60:
+        env.step(_ca_greedy(env))
+        steps += 1
+    if env.done:
+        return float(env.game.rewards[me - 1])
+    return _value_net.value_from_obs(ca_obs_from_env(env))
+
+
 def _random_opp_hands(game) -> dict:
     """A random opponent-hand world consistent with public info (correct sizes,
     drawn from the unseen cards)."""
@@ -220,9 +290,7 @@ def _random_opp_hands(game) -> dict:
 @torch.no_grad()
 def _belief_from_state(st) -> np.ndarray:
     """(3,52) P(opp i holds card c), i -> players 2,3,4, masked to unseen cards."""
-    S = _belief_net.state_embedding(_to_batch([st], _DEV))
-    bel = torch.sigmoid(_belief_net.belief_head(S)).reshape(3, 52).cpu().numpy()
-    return bel * unseen_mask_from_obs(st)
+    return belief_from_obs(_belief_net, st, _DEV)
 
 
 def _belief_opp_hands(game, belief) -> dict:
@@ -276,8 +344,7 @@ def _search_action(game, obs, legal, probs, belief=None):
             try:
                 env = _wrap(base.clone())
                 env.step(a)
-                r = _rollout(env)
-                Q[a] += float(r[me - 1])
+                Q[a] += _value_leaf(env, me) if _VALUE_LEAF else float(_rollout(env)[me - 1])
                 N[a] += 1
             except Exception:
                 pass
@@ -316,7 +383,8 @@ def _infer_cardaware(game, obs):
         belief = _belief_from_state(st) if _belief_net is not None else None
         best, sx = _search_action(game, obs, legal, probs.cpu().numpy(), belief=belief)
         action_idx = best
-        note = (f"cardaware+search{'+belief' if belief is not None else ''} "
+        note = (f"cardaware+search{'+belief' if belief is not None else ''}"
+                f"{'+value' if _VALUE_LEAF else ''} "
                 f"worlds={sx['worlds']} q={sx['q']} "
                 f"({time.time()-t0:.1f}s) policy_p={float(probs[pos]):.2f}")
         extra = {"search": sx, "value": float(value.item()), "n_legal": int(legal.size)}
