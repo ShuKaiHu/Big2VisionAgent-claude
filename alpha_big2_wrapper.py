@@ -59,56 +59,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Belief-guided world sampling (Phase 1) ───────────────────────────────────
-# BELIEF_WORLDS=1 → importance-sample opponent hands for each determinized MCTS
-# world from the learned BELIEF.pt (82.8% P@count on human data) instead of the
-# heuristic void sampler. policy (prior) + full-info value (leaf) are unchanged.
-# The agent is reconstructed as seat 1, and BeliefNet's output is clockwise-from-me
-# = seats [2,3,4], so belief[i] maps directly to opponent seat i+2 (no conversion).
-_AB2PPO = os.environ.get("AB2PPO", "/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo")
-if _AB2PPO not in sys.path:
-    sys.path.append(_AB2PPO)
-_BELIEF_WORLDS = os.environ.get("BELIEF_WORLDS") == "1"
-_belief_net = None
-if _BELIEF_WORLDS:
-    from ppo.belief_model import BeliefNet, belief_from_obs
-    from ppo.network_cardaware import obs_from_env as ca_obs_from_env
-    _bp = os.environ.get("BELIEF_CKPT", os.path.join(_AB2PPO, "ppo", "checkpoints", "saved", "BELIEF.pt"))
-    _belief_net = BeliefNet()
-    _belief_net.load_state_dict(torch.load(_bp, map_location="cpu")["model"])
-    _belief_net.eval()
-    log.info("belief net loaded: %s → belief-guided world sampling ON", os.path.basename(_bp))
-
-
-def _belief_dummy_hands(mock_game) -> dict[int, np.ndarray]:
-    """Valid filler opponent hands (correct sizes from the unseen pool). The belief
-    obs only reads our hand + played cards + counts, never opponents' contents, so
-    the filler contents are irrelevant — this just builds a well-formed big2Game."""
-    unknown, sizes = _unknown_and_sizes(mock_game)
-    out, i = {}, 0
-    for p in (2, 3, 4):
-        out[p] = np.array(sorted(unknown[i:i + sizes[p]]), dtype=np.int64)
-        i += sizes[p]
-    return out
-
-
-def _belief_assign_world(remaining: list, sizes: dict, belief: np.ndarray) -> dict[int, np.ndarray]:
-    """Partition `remaining` to opponents 2/3/4 by importance-sampling from belief
-    (belief[i] = P(seat i+2 holds the card)), respecting exact per-seat counts."""
-    cards = [int(c) for c in remaining]
-    np.random.shuffle(cards)
-    rem = {p: int(sizes[p]) for p in (2, 3, 4)}
-    out = {2: [], 3: [], 4: []}
-    for c in cards:
-        ps = [p for p in (2, 3, 4) if rem[p] > 0]
-        if not ps:
-            break
-        w = np.array([belief[p - 2][c - 1] for p in ps], dtype=np.float64) + 1e-6
-        w /= w.sum()
-        p = ps[int(np.random.choice(len(ps), p=w))]
-        out[p].append(c); rem[p] -= 1
-    return {p: np.array(sorted(out[p]), dtype=np.int64) for p in (2, 3, 4)}
-
 # ── Graded-confidence world sampler v2 (default ON; BIG2_VOID=0 disables) ────
 # Pass-derived constraints are BEHAVIORAL, not logic: an opponent may hoard a 2
 # rather than beat a 9. Each pass therefore yields a constraint with a measured
@@ -208,24 +158,9 @@ def _load_model() -> Big2Net:
     log.info("CKPT_TAG = %s", _CKPT_TAG)
     return model, value_model
 
-# Lazy model load: built on first _ensure_model() (called by main()), NOT at import
-# time. This lets a sibling wrapper (heuristic_wrapper.py) import this module for its
-# MockGame / mask / dashboard helpers WITHOUT pulling a torch model into memory or
-# requiring a checkpoint. MCTS behaviour is unchanged — main() loads the model before
-# the stdin loop, exactly as before (just a few ms later).
-_model = None
-_value_model = None
-_mcts = None
-_N_DETS = 1   # worlds per move; becomes 4 once a full-info value net is loaded (V9)
-
-
-def _ensure_model() -> None:
-    global _model, _value_model, _mcts, _N_DETS
-    if _mcts is not None:
-        return
-    _model, _value_model = _load_model()
-    _mcts = MCTS(_model, n_simulations=200, value_model=_value_model)
-    _N_DETS = 4 if _value_model is not None else 1   # V9: average 4 worlds
+_model, _value_model = _load_model()
+_mcts  = MCTS(_model, n_simulations=200, value_model=_value_model)
+_N_DETS = 4 if _value_model is not None else 1   # worlds per move (V9: average 4)
 
 # ── Card-code conversion ─────────────────────────────────────────────────────
 # Big2Vision code: "<suit_char><rank_char>"
@@ -639,12 +574,9 @@ def _assign_world(mock_game, pool: list, sizes: dict,
     return best
 
 
-def _sample_opponent_hands(mock_game: MockGame, belief: np.ndarray = None) -> dict[int, np.ndarray]:
+def _sample_opponent_hands(mock_game: MockGame) -> dict[int, np.ndarray]:
     """
     Sample plausible opponent hands given public info.
-
-    belief != None → importance-sample from the learned belief (Phase 1);
-    belief is None → heuristic void sampler v2 (original behaviour).
 
     Known:  our hand (player 1) + all played cards
     Unknown: remaining 52 - known cards, distributed to 3 opponents
@@ -681,12 +613,9 @@ def _sample_opponent_hands(mock_game: MockGame, belief: np.ndarray = None) -> di
     # 直接 cap 到 13 即可保持安全（Big2 任何玩家最多持 13 張）。
     sizes = {p: min(13, sizes[p]) for p in [2, 3, 4]}
 
-    # Belief-guided (Phase 1) when a belief is supplied; else heuristic void
-    # sampler v2 (BIG2_VOID=0 / no constraints → uniform random partition).
-    if belief is not None:
-        opp_hands = _belief_assign_world(remaining, sizes, belief)
-    else:
-        opp_hands = _assign_world(mock_game, remaining, sizes)
+    # Sampler v2: graded-confidence constraints + rejection. With BIG2_VOID=0
+    # (or no constraints yet) this reduces to a uniform random partition.
+    opp_hands = _assign_world(mock_game, remaining, sizes)
 
     total_needed = sum(sizes[p] for p in [2, 3, 4])
     if total_needed > len(remaining):
@@ -1061,19 +990,7 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
         g.passedThisRound[1] = False
         return env
 
-    # Belief-guided determinization (Phase 1): compute the learned belief ONCE per
-    # decision (public info only); each search world is importance-sampled from it.
-    # belief is None when BELIEF_WORLDS is off → heuristic worlds (unchanged).
-    belief = None
-    if _belief_net is not None:
-        try:
-            belief = belief_from_obs(
-                _belief_net, ca_obs_from_env(_build_search_env(_belief_dummy_hands(mock_game))))
-        except Exception as _be:
-            log.warning("belief compute failed (%s) → heuristic worlds", _be)
-
-    env = _build_search_env(
-        _sample_opponent_hands(mock_game, belief) if belief is not None else opp_hands)
+    env = _build_search_env(opp_hands)
     env_mask = env.get_valid_actions()
     overlap = (env_mask * obs_mask).sum()
 
@@ -1113,7 +1030,7 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
         dist = None
         n_sims = 0
         for i in range(_N_DETS):
-            env_i = env if i == 0 else _build_search_env(_sample_opponent_hands(mock_game, belief))
+            env_i = env if i == 0 else _build_search_env(_sample_opponent_hands(mock_game))
             _, visits_i = _mcts.run(env_i, temperature=0.0, time_limit=1.0 / _N_DETS)
             tot_i = visits_i.sum()
             n_sims += int(tot_i)
@@ -1439,7 +1356,6 @@ def _write_dashboard_state(
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    _ensure_model()   # load the torch model + MCTS now (was at import time before)
     # 啟動時清空舊狀態，讓 dashboard 從空白開始
     try:
         os.makedirs(os.path.dirname(_DASH_STATE_PATH), exist_ok=True)
