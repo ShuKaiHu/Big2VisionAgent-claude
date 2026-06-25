@@ -80,6 +80,15 @@ _VALUE_LEAF = os.environ.get("VALUE_LEAF") == "1"
 _VALUE_CKPT = os.environ.get(
     "VALUE_CKPT", "/Users/shukaihu/Code_Project_Local/AlphaBig2-Value/checkpoints/VALUE.pt")
 
+# ISMCTS=1 → true single-tree information-set MCTS (vs the flat PIMC _search_action).
+# One tree keyed by OUR action-path; each simulation re-determinizes a world from
+# belief; opponents play forward via the policy (environment); our nodes use PUCT
+# with the policy as prior; the leaf is the value net (our perspective); one shared
+# scorecard. Needs belief (determinize) + value (leaf).
+_ISMCTS = os.environ.get("ISMCTS") == "1"
+_ISMCTS_CPUCT = float(os.environ.get("ISMCTS_CPUCT", "1.5"))
+_ISMCTS_SIMS = int(os.environ.get("ISMCTS_SIMS", "200"))   # cap; _SEARCH_BUDGET also applies
+
 assert ACTION_FEATURES.shape[0] == enumerateOptions.passInd + 1, "action-space size mismatch"
 
 _DEV = "cpu"  # tiny net; single inferences — CPU is plenty and avoids subprocess GPU issues
@@ -359,6 +368,92 @@ def _search_action(game, obs, legal, probs, belief=None):
     return best, {"worlds": worlds, "q": {int(a): round(scored[a], 2) for a in cand}}
 
 
+# ── True ISMCTS (single information-set tree, re-determinized per simulation) ──
+@torch.no_grad()
+def _policy_eval(env):
+    """Policy net: (legal_idx, softmax probs) for the to-move player's legal actions."""
+    mask = env.get_valid_actions()
+    legal = np.flatnonzero(mask)
+    if legal.size == 0:
+        return np.array([PASS_IDX]), np.array([1.0], dtype=np.float32)
+    obs_t = _to_batch([ca_obs_from_env(env)], _DEV)
+    feats = torch.from_numpy(ACTION_FEATURES[legal]).unsqueeze(0).to(_DEV)
+    am = torch.ones(1, legal.size, dtype=torch.bool, device=_DEV)
+    logits, _ = _net.forward(obs_t, feats, am)
+    return legal, torch.softmax(logits[0], dim=-1).cpu().numpy()
+
+
+@torch.no_grad()
+def _leaf_value(env, me) -> float:
+    """Normalized (tanh, [-1,1]) expected final score for `me` at this OUR-turn leaf."""
+    if _value_net is not None:
+        return float(_value_net.forward(_to_batch([ca_obs_from_env(env)], _DEV))[0].item())
+    return float(np.tanh(np.asarray(_rollout(env))[me - 1] / _VALUE_SCALE))  # fallback: rollout
+
+
+def _ismcts_simulate(env, tree, me):
+    """One simulation on a determinized world. Tree nodes keyed by OUR action-path;
+    opponents play forward via the policy (environment); our nodes PUCT-select with
+    the policy prior; the leaf is value-net evaluated; value backed up to OUR edges."""
+    key = (); path = []; value = 0.0
+    while True:
+        if env.done:
+            value = float(np.tanh(env.game.rewards[me - 1] / _VALUE_SCALE)); break
+        if env.current_player != me:
+            env.step(_ca_greedy(env)); continue            # opponent = environment
+        legal_now, probs = _policy_eval(env)               # our legal + priors in THIS world
+        if key not in tree:                                # new info-set node = leaf → expand+eval
+            tree[key] = {"N": {}, "W": {}, "avail": {}}
+            value = _leaf_value(env, me); break
+        node = tree[key]
+        sqrt_av = max(sum(node["avail"].get(int(a), 0) for a in legal_now), 1) ** 0.5
+        best_a, best_s = int(legal_now[0]), -1e18
+        for j, a in enumerate(legal_now):
+            a = int(a); N = node["N"].get(a, 0)
+            Q = (node["W"][a] / N) if N > 0 else 0.0
+            s = Q + _ISMCTS_CPUCT * float(probs[j]) * sqrt_av / (1 + N)
+            if s > best_s:
+                best_s, best_a = s, a
+        for a in legal_now:                                # availability counts (Cowling ISMCTS)
+            a = int(a); node["avail"][a] = node["avail"].get(a, 0) + 1
+        path.append((key, best_a))
+        env.step(best_a)
+        key = key + (best_a,)
+    for k, a in path:                                      # backup OUR value along OUR edges
+        nd = tree[k]
+        nd["N"][a] = nd["N"].get(a, 0) + 1
+        nd["W"][a] = nd["W"].get(a, 0.0) + value
+
+
+def _ismcts_action(game, obs, belief):
+    """ISMCTS root: re-determinize from belief each simulation, share one tree,
+    return (best_action, info). best = most-visited OUR root action."""
+    me = game.playersGo
+    tree = {}
+    t0 = time.time(); sims = 0
+    while sims < _ISMCTS_SIMS and (time.time() - t0) < _SEARCH_BUDGET:
+        world = _belief_opp_hands(game, belief) if belief is not None else _random_opp_hands(game)
+        base = _apply_trick(abw._build_game_for_mcts(game, world), obs)
+        if base.passCount >= 3:                            # same engine-loop guard as PIMC
+            base.passCount = 0
+            base.passedThisRound = {1: False, 2: False, 3: False, 4: False}
+        try:
+            _ismcts_simulate(_wrap(base.clone()), tree, me)
+        except Exception:
+            pass
+        sims += 1
+        if sims % 8 == 0:
+            gc.collect()
+    gc.collect()
+    root = tree.get((), {"N": {}, "W": {}})
+    visits = root["N"]
+    if not visits:
+        return None, {"sims": sims, "visits": {}}
+    best = max(visits, key=visits.get)
+    q = {int(a): round(root["W"][a] / visits[a], 3) for a in visits}
+    return best, {"sims": sims, "visits": {int(a): visits[a] for a in visits}, "q": q}
+
+
 def _infer_cardaware(game, obs):
     """Return (action_idx, note, extra)."""
     mask = abw._build_mask(obs)
@@ -377,6 +472,18 @@ def _infer_cardaware(game, obs):
         probs = torch.softmax(logits[0], dim=-1)
         pos = int(torch.argmax(logits[0]).item())
     action_idx = int(legal[pos])
+
+    if _ISMCTS and legal.size > 1:
+        t0 = time.time()
+        belief = _belief_from_state(st) if _belief_net is not None else None
+        best, sx = _ismcts_action(game, obs, belief)
+        if best is not None:
+            action_idx = best
+        note = (f"cardaware+ismcts{'+belief' if belief is not None else ''}"
+                f"{'+value' if _value_net is not None else ''} sims={sx['sims']} "
+                f"({time.time()-t0:.1f}s) policy_p={float(probs[pos]):.2f}")
+        extra = {"ismcts": sx, "value": float(value.item()), "n_legal": int(legal.size)}
+        return action_idx, note, extra
 
     if _SEARCH and legal.size > 1:
         t0 = time.time()
