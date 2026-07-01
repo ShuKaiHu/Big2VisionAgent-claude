@@ -77,8 +77,11 @@ _BELIEF_SEARCH = os.environ.get("BELIEF_SEARCH") == "1"
 _BELIEF_CKPT = os.environ.get(
     "BELIEF_CKPT", os.path.join(_AB2PPO, "ppo", "checkpoints", "saved", "BELIEF.pt"))
 _VALUE_LEAF = os.environ.get("VALUE_LEAF") == "1"
+# Deploy value = VALUE_minplays.pt (public obs + min-plays/13). Ablation (200k):
+# min-plays earns the whole +8.5% MSE; dominance was ~redundant for position value.
+# extra_dim is auto-detected from the checkpoint, so plain VALUE.pt still loads.
 _VALUE_CKPT = os.environ.get(
-    "VALUE_CKPT", "/Users/shukaihu/Code_Project_Local/AlphaBig2-Value/checkpoints/VALUE.pt")
+    "VALUE_CKPT", "/Users/shukaihu/Code_Project_Local/AlphaBig2-Value/checkpoints/VALUE_minplays.pt")
 
 # ISMCTS=1 → true single-tree information-set MCTS (vs the flat PIMC _search_action).
 # One tree keyed by OUR action-path; each simulation re-determinizes a world from
@@ -125,11 +128,12 @@ _VALUE_SCALE, _VD, _VE = 13.0, 64, 256
 
 
 class ValueNet(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, extra_dim=0):
         super().__init__()
+        self.extra_dim = extra_dim            # +obs["feat"] (deploy: 1 = min-plays/13)
         self.card_emb = torch.nn.Embedding(53, _VD, padding_idx=0)
         self.hand_attn = torch.nn.MultiheadAttention(_VD, num_heads=4, batch_first=True)
-        _si = _VD + _VD + 3 * _VD + _VD + 3 + 1
+        _si = _VD + _VD + 3 * _VD + _VD + 3 + 1 + extra_dim
         self.enc = torch.nn.Sequential(
             torch.nn.Linear(_si, _VE), torch.nn.ReLU(),
             torch.nn.Linear(_VE, _VE), torch.nn.ReLU(),
@@ -149,21 +153,85 @@ class ValueNet(torch.nn.Module):
         opp_vec = (obs["opp"] @ cards).reshape(obs["opp"].shape[0], -1)
         trick_vec = obs["trick"] @ cards
         si = torch.cat([hand_vec, seen_vec, opp_vec, trick_vec, obs["counts"], obs["passc"]], dim=-1)
+        if self.extra_dim:
+            si = torch.cat([si, obs["feat"]], dim=-1)
         return self.value_head(self.enc(si)).squeeze(-1)
 
-    @torch.no_grad()
-    def value_from_obs(self, st) -> float:
-        return float(self.forward(_to_batch([st], _DEV))[0].item()) * _VALUE_SCALE
+
+# min-plays-to-empty (greedy fewest legal plays to go out) — the deploy value's
+# extra feature. Inlined (like ValueNet) to keep the wrapper self-contained; mirror
+# of AlphaBig2-Value/hand_features.py.
+from collections import Counter as _Counter
+_MP_WIN = [tuple(range(s, s + 5)) for s in range(1, 9)] + [(12, 13, 1, 2, 3), (13, 1, 2, 3, 4)]
+
+
+def _mp_rank(c):
+    return (c - 1) // 4 + 1
+
+
+def _mp_extract_five(rem):
+    rc = _Counter(_mp_rank(c) for c in rem)
+    for r, n in rc.items():
+        if n >= 4:
+            quad = [c for c in rem if _mp_rank(c) == r][:4]
+            kicker = [c for c in rem if c not in quad][:1]
+            if kicker:
+                return quad + kicker
+    trips = [r for r, n in rc.items() if n >= 3]
+    for t in trips:
+        for r, n in rc.items():
+            if r != t and n >= 2:
+                return [c for c in rem if _mp_rank(c) == t][:3] + [c for c in rem if _mp_rank(c) == r][:2]
+    have = {}
+    for c in rem:
+        have.setdefault(_mp_rank(c), []).append(c)
+    for w in _MP_WIN:
+        if all(r in have for r in w):
+            return [have[r][0] for r in w]
+    return None
+
+
+def min_plays_to_empty(cards):
+    rem = [int(c) for c in cards]; plays = 0
+    while True:
+        five = _mp_extract_five(rem)
+        if not five:
+            break
+        for c in five:
+            rem.remove(c)
+        plays += 1
+    rc = _Counter(_mp_rank(c) for c in rem)
+    for r in rc:
+        while sum(1 for c in rem if _mp_rank(c) == r) >= 2:
+            for c in [c for c in rem if _mp_rank(c) == r][:2]:
+                rem.remove(c)
+            plays += 1
+    return plays + len(rem)
 
 
 _value_net = None
+_value_extra_dim = 0
 if _VALUE_LEAF:
     _vk = torch.load(_VALUE_CKPT, map_location=_DEV, weights_only=False)
-    _value_net = ValueNet().to(_DEV)
+    _value_extra_dim = int(_vk.get("extra_dim", 0))   # 1 = min-plays; 0 = plain VALUE.pt
+    _value_net = ValueNet(extra_dim=_value_extra_dim).to(_DEV)
     _value_net.load_state_dict(_vk["model"])
     _value_net.eval()
-    log.info("value net loaded: %s (val_mse=%s) — value-leaf eval ON",
-             os.path.basename(_VALUE_CKPT), _vk.get("val_mse"))
+    log.info("value net loaded: %s (extra_dim=%d, val_mse=%s) — value-leaf eval ON",
+             os.path.basename(_VALUE_CKPT), _value_extra_dim, _vk.get("val_mse"))
+
+
+@torch.no_grad()
+def _value_eval(env, me, real_units=False) -> float:
+    """Value net at an OUR-turn leaf, me's perspective. Adds the min-plays feature
+    (over me's KNOWN remaining hand) when the deploy value expects it. real_units
+    multiplies by the score scale (PIMC wants real score; ISMCTS wants tanh)."""
+    b = _to_batch([ca_obs_from_env(env)], _DEV)
+    if _value_extra_dim:
+        mp = min_plays_to_empty([int(c) for c in env.game.currentHands[me]]) / 13.0
+        b["feat"] = torch.tensor([[mp]], dtype=torch.float32, device=_DEV)
+    v = float(_value_net.forward(b)[0].item())
+    return v * _VALUE_SCALE if real_units else v
 
 
 class _EnvShim:
@@ -278,7 +346,7 @@ def _value_leaf(env, me) -> float:
         steps += 1
     if env.done:
         return float(env.game.rewards[me - 1])
-    return _value_net.value_from_obs(ca_obs_from_env(env))
+    return _value_eval(env, me, real_units=True)
 
 
 def _random_opp_hands(game) -> dict:
@@ -387,14 +455,16 @@ def _policy_eval(env):
 def _leaf_value(env, me) -> float:
     """Normalized (tanh, [-1,1]) expected final score for `me` at this OUR-turn leaf."""
     if _value_net is not None:
-        return float(_value_net.forward(_to_batch([ca_obs_from_env(env)], _DEV))[0].item())
+        return _value_eval(env, me, real_units=False)
     return float(np.tanh(np.asarray(_rollout(env))[me - 1] / _VALUE_SCALE))  # fallback: rollout
 
 
-def _ismcts_simulate(env, tree, me):
+def _ismcts_simulate(env, tree, me, allowed=None):
     """One simulation on a determinized world. Tree nodes keyed by OUR action-path;
     opponents play forward via the policy (environment); our nodes PUCT-select with
-    the policy prior; the leaf is value-net evaluated; value backed up to OUR edges."""
+    the policy prior; the leaf is value-net evaluated; value backed up to OUR edges.
+    `allowed` (a set of action indices) restricts OUR ROOT move to the house-rule-legal
+    set (e.g. the one-card rule) — the engine's valid moves don't know that rule."""
     key = (); path = []; value = 0.0
     while True:
         if env.done:
@@ -402,6 +472,10 @@ def _ismcts_simulate(env, tree, me):
         if env.current_player != me:
             env.step(_ca_greedy(env)); continue            # opponent = environment
         legal_now, probs = _policy_eval(env)               # our legal + priors in THIS world
+        if not key and allowed is not None:                # ROOT: enforce house-rule-legal set
+            km = np.array([int(a) in allowed for a in legal_now], dtype=bool)
+            if km.any():
+                legal_now, probs = legal_now[km], probs[km]
         if key not in tree:                                # new info-set node = leaf → expand+eval
             tree[key] = {"N": {}, "W": {}, "avail": {}}
             value = _leaf_value(env, me); break
@@ -425,9 +499,10 @@ def _ismcts_simulate(env, tree, me):
         nd["W"][a] = nd["W"].get(a, 0.0) + value
 
 
-def _ismcts_action(game, obs, belief):
+def _ismcts_action(game, obs, belief, allowed=None):
     """ISMCTS root: re-determinize from belief each simulation, share one tree,
-    return (best_action, info). best = most-visited OUR root action."""
+    return (best_action, info). best = most-visited OUR root action. `allowed`
+    restricts the root move to the house-rule-legal set (one-card rule etc.)."""
     me = game.playersGo
     tree = {}
     t0 = time.time(); sims = 0
@@ -438,7 +513,7 @@ def _ismcts_action(game, obs, belief):
             base.passCount = 0
             base.passedThisRound = {1: False, 2: False, 3: False, 4: False}
         try:
-            _ismcts_simulate(_wrap(base.clone()), tree, me)
+            _ismcts_simulate(_wrap(base.clone()), tree, me, allowed)
         except Exception:
             pass
         sims += 1
@@ -446,7 +521,7 @@ def _ismcts_action(game, obs, belief):
             gc.collect()
     gc.collect()
     root = tree.get((), {"N": {}, "W": {}})
-    visits = root["N"]
+    visits = {a: n for a, n in root["N"].items() if allowed is None or int(a) in allowed}
     if not visits:
         return None, {"sims": sims, "visits": {}}
     best = max(visits, key=visits.get)
@@ -473,11 +548,12 @@ def _infer_cardaware(game, obs):
         pos = int(torch.argmax(logits[0]).item())
     action_idx = int(legal[pos])
 
+    _legal_set = set(int(a) for a in legal)   # house-rule-legal (incl. one-card rule)
     if _ISMCTS and legal.size > 1:
         t0 = time.time()
         belief = _belief_from_state(st) if _belief_net is not None else None
-        best, sx = _ismcts_action(game, obs, belief)
-        if best is not None:
+        best, sx = _ismcts_action(game, obs, belief, _legal_set)
+        if best is not None and int(best) in _legal_set:   # invariant: never play outside legal
             action_idx = best
         note = (f"cardaware+ismcts{'+belief' if belief is not None else ''}"
                 f"{'+value' if _value_net is not None else ''} sims={sx['sims']} "

@@ -801,31 +801,33 @@ def _to_decision(action_idx: int) -> dict:
 def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray, mock_game) -> np.ndarray:
     """Filter obs_mask to enforce the house rule:
 
-    When the player who ACTUALLY ACTS NEXT after us has exactly 1 card remaining,
-    a single is restricted to the HIGHEST legal single (so we don't hand them the
-    trick by playing low). Non-single plays are unrestricted.
+    When ANY still-active opponent has exactly 1 card remaining, a single is
+    restricted to the HIGHEST legal single (so we never hand a near-winner the trick
+    by playing low). This is NOT just the immediate next actor — any downstream
+    1-card opponent (下家 / 下下家 / 下下下家) could take a low single and go out, so
+    all of them trigger the rule. Non-single plays are unrestricted; PASS stays legal.
 
-    The next actor is NOT always the "right" seat: turn order is self→right→top
-    →left, but a seat is skipped if it is OUT (0 cards) or — within the current
-    trick (following) — has already PASSED. So when right and top are out/passed,
-    the next actor is "left" (上家), and the rule must key off LEFT's count.
-    (Bug fix 2026-06-15: previously hard-coded to the right seat only.)
+    A seat is "still active" if it is NOT out (0 cards) and — when we are following a
+    trick — has NOT already passed this round (a passed seat cannot take THIS trick).
+    (2026-06-15: skip out/passed seats. 2026-07-01: broadened from the single
+    "effective next actor" to ANY still-active downstream 1-card opponent.)
 
     Returns a (possibly modified) copy of obs_mask.
     """
     following = (mock_game.control == 0)
-    next_seat = None
+    _NAME = {2: "right", 3: "top", 4: "left"}
+    one_card_seats = []
     for seat in (2, 3, 4):   # self=1 → right=2 → top=3 → left=4
         if mock_game.currentHands[seat].size == 0:
-            continue                                   # already finished → skipped
+            continue                                   # out → cannot take the trick
         if following and mock_game.passedThisRound.get(seat):
-            continue                                   # passed this trick → won't respond
-        next_seat = seat
-        break
-    if next_seat is None or mock_game.currentHands[next_seat].size != 1:
-        return obs_mask   # Rule inactive (effective next player ≠ exactly 1 card)
-    log.info("One-card rule: effective next player = seat %d (%s) has 1 card",
-             next_seat, {2: "right", 3: "top", 4: "left"}[next_seat])
+            continue                                   # passed this trick → cannot take it
+        if mock_game.currentHands[seat].size == 1:
+            one_card_seats.append(seat)
+    if not one_card_seats:
+        return obs_mask   # Rule inactive (no still-active opponent on exactly 1 card)
+    log.info("One-card rule: still-active opponent(s) on 1 card at seat(s) %s",
+             [_NAME[s] for s in one_card_seats])
 
     # Collect all single-card action indices that are currently legal
     legal_singles: list[tuple[int, int]] = []   # (card_id, action_idx)
