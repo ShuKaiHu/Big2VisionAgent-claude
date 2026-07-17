@@ -796,21 +796,61 @@ def _to_decision(action_idx: int) -> dict:
     return {"action": "play", "card_codes": codes, "combo_type": combo}
 
 
+# ── Must-play-3♣: opening lead of a new game must INCLUDE 3♣, not just be ────
+# ── "any play" with PASS disabled (that was the bug — see below) ──────────────
+
+def _apply_must_play_club3(obs_mask: np.ndarray, mock_game) -> np.ndarray:
+    """Filter obs_mask to enforce the opening-of-game house rule: whoever holds
+    3♣ (card_id=1) must lead the very first play of a NEW GAME with a combo that
+    INCLUDES 3♣ (single, or as part of a pair/straight/full house/etc).
+
+    2026-07-04 bug found online: the previous enforcement (still inline in
+    `_infer`) only disabled PASS when mustPlayClub3, leaving every OTHER legal
+    combo enabled — including full houses/straights that don't contain 3♣. The
+    agent would pick one of those (locally valid Big2 combos), the real game
+    client rejects it (not the required opening lead), and our executor then
+    hangs waiting for a confirmation that never comes (play_confirmation_timeout).
+
+    Returns a (possibly modified) copy of obs_mask."""
+    if not mock_game.mustPlayClub3:
+        return obs_mask
+    new_mask = obs_mask.copy()
+    new_mask[enumerateOptions.passInd] = 0.0    # can't pass on the opening lead
+    for a in np.flatnonzero(new_mask):
+        a = int(a)
+        if a == enumerateOptions.passInd:
+            continue
+        cids, _n = enumerateOptions.getOptionNC(a)
+        if 1 not in cids:                        # card_id 1 == 3♣
+            new_mask[a] = 0.0
+    if not new_mask.any():
+        log.warning("mustPlayClub3 但過濾後沒有合法出牌 — 保留 pass 作為 fallback")
+        new_mask[enumerateOptions.passInd] = 1.0
+    return new_mask
+
+
 # ── One-card rule: restrict singles when any opponent has 1 card ──────────────
 
 def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray, mock_game) -> np.ndarray:
     """Filter obs_mask to enforce the house rule:
 
-    When ANY still-active opponent has exactly 1 card remaining, a single is
-    restricted to the HIGHEST legal single (so we never hand a near-winner the trick
-    by playing low). This is NOT just the immediate next actor — any downstream
-    1-card opponent (下家 / 下下家 / 下下下家) could take a low single and go out, so
-    all of them trigger the rule. Non-single plays are unrestricted; PASS stays legal.
+    When the EFFECTIVE NEXT ACTOR (the first still-active downstream seat — the
+    one who will actually respond to whatever I play next) has exactly 1 card
+    remaining, a single is restricted to the HIGHEST legal single (so we never
+    hand a near-winner the trick by playing low). Non-single plays are
+    unrestricted; PASS stays legal.
 
     A seat is "still active" if it is NOT out (0 cards) and — when we are following a
     trick — has NOT already passed this round (a passed seat cannot take THIS trick).
-    (2026-06-15: skip out/passed seats. 2026-07-01: broadened from the single
-    "effective next actor" to ANY still-active downstream 1-card opponent.)
+    We walk 下家/對家/上家 in turn order and STOP at the first still-active seat: a
+    still-active seat with 2+ cards is a genuine buffer (they get the next real
+    decision, and may beat/absorb the trick themselves), so a 1-card threat further
+    downstream isn't yet live -- forcing our highest card for it is over-cautious.
+    (2026-06-15: skip out/passed seats, stop at effective next actor. 2026-07-01:
+    briefly broadened to ANY still-active downstream 1-card opponent regardless of
+    an intervening active buffer -- reverted 2026-07-08, confirmed wrong: e.g. 對家
+    on 1 card behind an active, not-yet-passed 下家 does NOT make 對家 an immediate
+    threat, since 下家 gets the real next decision first.)
 
     Returns a (possibly modified) copy of obs_mask.
     """
@@ -822,11 +862,15 @@ def _apply_one_card_rule(obs: dict, obs_mask: np.ndarray, mock_game) -> np.ndarr
             continue                                   # out → cannot take the trick
         if following and mock_game.passedThisRound.get(seat):
             continue                                   # passed this trick → cannot take it
+        # First still-active seat = the effective next actor. Stop here regardless
+        # of its card count -- a 2+ card buffer means any downstream 1-card threat
+        # isn't immediate yet.
         if mock_game.currentHands[seat].size == 1:
             one_card_seats.append(seat)
+        break
     if not one_card_seats:
-        return obs_mask   # Rule inactive (no still-active opponent on exactly 1 card)
-    log.info("One-card rule: still-active opponent(s) on 1 card at seat(s) %s",
+        return obs_mask   # Rule inactive (effective next actor isn't on exactly 1 card)
+    log.info("One-card rule: effective next actor on 1 card at seat(s) %s",
              [_NAME[s] for s in one_card_seats])
 
     # Collect all single-card action indices that are currently legal
@@ -944,13 +988,8 @@ def _infer(mock_game: MockGame, obs: dict) -> tuple[int, str, dict]:
         log.warning("No legal actions — defaulting to pass")
         return enumerateOptions.passInd, "fallback:no_legal_actions", extra
 
-    if mock_game.mustPlayClub3:
-        obs_mask[enumerateOptions.passInd] = 0.0
-        legal = np.flatnonzero(obs_mask)
-        if len(legal) == 0:
-            log.warning("mustPlayClub3 但 mask 裡沒有合法出牌 — 保留 pass 作為 fallback")
-            obs_mask[enumerateOptions.passInd] = 1.0
-            legal = np.array([enumerateOptions.passInd])
+    obs_mask = _apply_must_play_club3(obs_mask, mock_game)
+    legal = np.flatnonzero(obs_mask)
 
     obs_mask = _apply_one_card_rule(obs, obs_mask, mock_game)
     legal = np.flatnonzero(obs_mask)
