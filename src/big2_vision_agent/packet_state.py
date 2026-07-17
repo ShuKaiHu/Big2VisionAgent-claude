@@ -8,6 +8,7 @@ from big2_vision_agent.agent_schema import (
     AgentCard,
     AgentObservation,
     OpponentState,
+    PlayEvent,
     TurnConstraint,
 )
 from big2_vision_agent.network_parser import classify_cards
@@ -43,6 +44,11 @@ FIVE_CARD_HIERARCHY = {
     "straight_flush": 3,
 }
 
+# Only these two types are "bombs" -- they can beat ANY other 5-card type
+# regardless of rank. straight/full_house are NOT freely ordered against each
+# other; a follow-up of either type must match the same type to compare.
+_BOMB_TYPES = {"four_of_a_kind", "straight_flush"}
+
 STRAIGHT_RANK_PATTERNS = [
     ("A", "2", "3", "4", "5"),
     ("3", "4", "5", "6", "7"),
@@ -72,6 +78,9 @@ def build_agent_observation(timeline: list[dict[str, object]]) -> AgentObservati
         "top": None,
         "right": None,
     }
+    # Authoritative, complete ordered play/pass log for the CURRENT game.
+    # Reset on every game boundary (finish3) so it only ever covers one game.
+    play_history: list[PlayEvent] = []
     source_seq = None
 
     for item in timeline:
@@ -92,12 +101,31 @@ def build_agent_observation(timeline: list[dict[str, object]]) -> AgentObservati
             last_played_by = actor
             passes_since_last_play = 0
             turn = _next_actor(actor)
+            if actor in {"self", "left", "top", "right"}:
+                play_history.append(
+                    PlayEvent(
+                        actor=actor,
+                        action="play",
+                        card_codes=[
+                            str(card.get("code"))
+                            for card in item.get("decoded_cards", [])
+                            if card.get("code") is not None
+                        ],
+                        combo_type=(item.get("combo") or {}).get("type"),
+                        ts=item.get("ts") if isinstance(item.get("ts"), int) else None,
+                    )
+                )
             continue
 
         if event == "player_pass":
             actor = item.get("actor")
             passes_since_last_play += 1
             turn = _next_actor(actor)
+            if actor in {"self", "left", "top", "right"}:
+                play_history.append(PlayEvent(
+                    actor=actor, action="pass",
+                    ts=item.get("ts") if isinstance(item.get("ts"), int) else None,
+                ))
             if passes_since_last_play >= 3:
                 required_combo_type = None
                 last_played_cards = []
@@ -122,6 +150,7 @@ def build_agent_observation(timeline: list[dict[str, object]]) -> AgentObservati
             last_played_by = None
             passes_since_last_play = 0
             turn = "unknown"
+            play_history = []
             continue
 
     hand_cards = [_agent_card_from_decoded(_decode_or_stub(code)) for code in current_hand]
@@ -152,6 +181,7 @@ def build_agent_observation(timeline: list[dict[str, object]]) -> AgentObservati
             OpponentState(seat="right", remaining_count=remaining_counts["right"]),
         ],
         legal_actions=legal_actions,
+        play_history=play_history,
         source_seq=source_seq if isinstance(source_seq, int) else None,
     )
 
@@ -369,8 +399,6 @@ def _build_legal_actions(
             for card in sorted_hand
         ]
         actions.extend(_filter_against_last_play(singles, "single", last_played_cards))
-        if required_combo_type == "single":
-            return actions
 
     if required_combo_type in {None, "pair"}:
         pairs = [
@@ -378,21 +406,24 @@ def _build_legal_actions(
             for pair in _find_pairs(sorted_hand)
         ]
         actions.extend(_filter_against_last_play(pairs, "pair", last_played_cards))
-        if required_combo_type == "pair":
-            return actions
 
     valid_five_card_types = set(FIVE_CARD_HIERARCHY)
-    allow_five_card_actions = (
-        required_combo_type is None
-        or required_combo_type == "five_card"
-        or required_combo_type in valid_five_card_types
-    )
+    # On a SINGLE/PAIR trick only a BOMB (four_of_a_kind / straight_flush) may be
+    # played as an override; on a five-card trick or free lead all five-card types
+    # apply. (2026-07 fix: this used to `return` early on single/pair, so bombs were
+    # never generated and the online agent could not bomb a small trick.)
+    if required_combo_type in {"single", "pair"}:
+        allowed_five_types = set(_BOMB_TYPES)
+    elif required_combo_type is None or required_combo_type == "five_card" or required_combo_type in valid_five_card_types:
+        allowed_five_types = valid_five_card_types
+    else:
+        allowed_five_types = set()
 
-    if allow_five_card_actions:
+    if allowed_five_types:
         five_actions: list[AgentActionOption] = []
         for combo_cards in combinations(sorted_hand, 5):
             combo_type = _classify_agent_cards(list(combo_cards))
-            if combo_type not in valid_five_card_types:
+            if combo_type not in allowed_five_types:
                 continue
             five_actions.append(
                 AgentActionOption(action="play", cards=list(combo_cards), combo_type=combo_type)
@@ -516,11 +547,35 @@ def _combo_beats(
     if combo_type in FIVE_CARD_HIERARCHY:
         if last_type == "dragon":
             return False
-        if last_type in FIVE_CARD_HIERARCHY and FIVE_CARD_HIERARCHY[combo_type] != FIVE_CARD_HIERARCHY[last_type]:
-            return FIVE_CARD_HIERARCHY[combo_type] > FIVE_CARD_HIERARCHY[last_type]
-        if last_type in FIVE_CARD_HIERARCHY:
+        # BOMB override: a four_of_a_kind / straight_flush may be played on a SINGLE
+        # or PAIR trick and beats it (matches engine returnAvailableActions:637-661).
+        # This was missing, so the online agent could never bomb a single/pair even
+        # while holding a quad/straight-flush.
+        if combo_type in _BOMB_TYPES and last_type in {"single", "pair"}:
+            return True
+        if last_type not in FIVE_CARD_HIERARCHY:
+            return False
+        # 2026-07-05 bug: this used to treat FIVE_CARD_HIERARCHY as a total order
+        # where ANY higher-tier type beats ANY lower one (e.g. full_house always
+        # beats straight). The real rule (matches enumerateOptions.fiveCardOptions
+        # in the engine): a BOMB (four_of_a_kind / straight_flush) beats any
+        # non-bomb 5-card combo, but non-bomb combos (straight, full_house) must
+        # match the SAME type to compare -- a full house can NEVER beat a straight
+        # (or vice versa) no matter the rank. This caused a live "牌型錯誤" reject:
+        # agent held a natural four-Jacks quad, an opponent led a straight, and the
+        # (buggy) legal-action list offered "full house beats straight" -- the
+        # real server correctly rejected it.
+        if last_type in _BOMB_TYPES:
+            if combo_type not in _BOMB_TYPES:
+                return False
+            if FIVE_CARD_HIERARCHY[combo_type] != FIVE_CARD_HIERARCHY[last_type]:
+                return FIVE_CARD_HIERARCHY[combo_type] > FIVE_CARD_HIERARCHY[last_type]
             return _combo_signature(cards, combo_type) > _combo_signature(last_played_cards, last_type)
-        return False
+        if combo_type in _BOMB_TYPES:
+            return True
+        if combo_type != last_type:
+            return False
+        return _combo_signature(cards, combo_type) > _combo_signature(last_played_cards, last_type)
 
     return False
 
