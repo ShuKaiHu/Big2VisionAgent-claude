@@ -50,8 +50,16 @@ NETWORK_HOOK_SCRIPT = r"""
         ts: Date.now(),
         ...entry,
       });
-      if (window.__big2NetworkLog.length > 5000) {
-        window.__big2NetworkLog.splice(0, window.__big2NetworkLog.length - 5000);
+      // 2026-07-04: was capped at 5000, which silently truncates the OLDEST
+      // messages first. A long autoplay session (60-70+ games) generates
+      // ~350-400 ws messages/game, so 5000 only ever retained the LAST ~13-14
+      // games -- everything earlier in the session was gone by the time
+      // save_network_log() ran at the end, so parse_online_games.py could only
+      // ever reconstruct a small tail slice (~20% yield observed, matching
+      // 13-14/66). Raised with large headroom (~500 games' worth); trivial
+      // memory cost (small JSON objects) for a modern browser tab.
+      if (window.__big2NetworkLog.length > 200000) {
+        window.__big2NetworkLog.splice(0, window.__big2NetworkLog.length - 200000);
       }
     } catch (error) {}
   }
