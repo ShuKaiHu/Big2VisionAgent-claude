@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import random
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -56,6 +57,13 @@ DEFAULT_EVENT_CLOSE_X = 1695.0
 DEFAULT_EVENT_CLOSE_Y = 68.0
 DEFAULT_MODAL_CLOSE_X = 1308.0
 DEFAULT_MODAL_CLOSE_Y = 257.0
+# 儲值神幣大放送's own X badge, at the top-right of ITS OWN (narrower, inset)
+# modal box -- distinct from DEFAULT_MODAL_CLOSE_X/Y's position, which is
+# calibrated for a different/wider modal style and does not land on this
+# dialog's X. Measured from a live stuck-bounce screenshot: pixel (1290, 145)
+# in a 1440x1080 capture, scaled to the 1728x1152 design canvas.
+DEFAULT_STORAGE_PROMO_CLOSE_X = 1548.0
+DEFAULT_STORAGE_PROMO_CLOSE_Y = 155.0
 DEFAULT_AMOUNT_TARGET = "10元"
 DEFAULT_RULE_TARGET = "不換牌"
 IDLE_POLL_MS = 180
@@ -1666,6 +1674,39 @@ async def wait_for_game_scene(page, timeout_seconds: int = 60) -> str | None:
     return last_scene
 
 
+async def _label_containing(page, needle: str) -> bool:
+    """True if any ACTIVE node's label text contains `needle` right now.
+    Used to VERIFY a close click actually worked instead of trusting that the
+    click call didn't raise -- safe_click_design_position/click_canvas_design_
+    position return a result dict as soon as the click itself executes, with
+    no idea whether it landed on the real close button or on empty space next
+    to it. That gap let a coordinate-fallback click report cleared=True while
+    the dialog stayed open, causing a second live stuck-bounce incident
+    (2026-07-07) even after the tab/title anchor-collision bug was fixed."""
+    try:
+        return bool(await page.evaluate("""
+        (needle) => {
+            const cc = window.cc;
+            if (!cc || !cc.director) return false;
+            const scene = cc.director.getScene();
+            if (!scene) return false;
+            let found = false;
+            (function walk(node) {
+                if (found || !node || !node.active) return;
+                const label = node.getComponent &&
+                    (node.getComponent('cc.Label') || node.getComponent(cc.Label));
+                if (label && typeof label.string === 'string' && label.string.includes(needle)) {
+                    found = true; return;
+                }
+                for (const c of (node.children || [])) walk(c);
+            })(scene);
+            return found;
+        }
+        """, needle))
+    except Exception:
+        return False
+
+
 async def maybe_clear_lobby_popup(page) -> bool:
     """
     Attempt to dismiss any lobby popup.
@@ -1814,6 +1855,12 @@ async def maybe_clear_lobby_popup(page) -> bool:
     # cc.Button inside it (the X) — and HARD-EXCLUDE any button whose subtree
     # contains a purchase label. Both the position rule and the label exclusion
     # independently guarantee we never hit "立即使用". No-ops if not found.
+    # 2026-07-04: this same dialog family also covers "時光禮盒" (daily login
+    # gift box popup) — it caused a ~1.5h stuck bounce loop online (no hint
+    # matched -> findDialog never found it -> no-op every retry). Add new
+    # promo-dialog titles here as they're discovered; the click logic doesn't
+    # need to change since it already generically picks the top-right button.
+    promo_before = await _label_containing(page, "儲值神幣大放送")
     try:
         reward_result = await page.evaluate("""
         (() => {
@@ -1821,8 +1868,37 @@ async def maybe_clear_lobby_popup(page) -> bool:
             if (!cc || !cc.director) return null;
             const scene = cc.director.getScene();
             if (!scene) return null;
-            const REWARD_HINTS = ['恭喜', '好禮', '儲值好禮', '優惠', '獲得儲值'];
+            const REWARD_HINTS = ['恭喜', '好禮', '儲值好禮', '優惠', '獲得儲值', '時光禮盒', '本日獎勵',
+                                  '儲值神幣大放送', '神幣大放送'];
             const PURCHASE_TEXTS = ['立即使用', '立即', '儲值', '充值', '購買', '購', 'NT$', '元'];
+            // 2026-07-05: 儲值神幣大放送 has a row of TABS across its top
+            // (神幣大放送/時空尋寶記/賓賓有禮/金豬簽到簿) plus a "獎勵表" button near the
+            // top-right of the inner panel -- all of these are real cc.Button nodes
+            // that sit close to (or above) the actual X in top-right-first sort order,
+            // so the old logic could click a tab (switches tab, dialog stays open) or
+            // the rewards-table button instead of really closing the dialog. Exclude
+            // them by their known label text (confirmed via screenshot of a live stuck
+            // instance), same pattern as the purchase-button exclusion below.
+            const NON_CLOSE_TEXTS = ['神幣大放送', '時空尋寶記', '賓賓有禮', '金豬簽到簿', '獎勵表'];
+            // 2026-07-06: the first tab's OWN label is the bare '神幣大放送' -- the
+            // exact same string kept in REWARD_HINTS to detect the dialog by title
+            // (title reads '儲值神幣大放送'). Two distinct bugs from this collision,
+            // both hit live (stuck bounce loops eating 1h50m+ of separate 2-4h
+            // online-test windows on two different days):
+            // (a) findDialog() anchors on whichever matching label it meets FIRST;
+            //     if it meets the tab before the title, the 6-level ancestor climb
+            //     lands on a too-narrow subtree that doesn't even contain the real
+            //     close X -- fixed by also excluding it from the anchor match below.
+            // (b) even after anchoring correctly, if the real X isn't a genuine
+            //     cc.Button (or otherwise isn't collected), collect() falls back to
+            //     the highest-ranked LABELED candidate -- and without this entry in
+            //     NON_CLOSE_TEXTS, that could be the tab itself: clicking it just
+            //     re-selects the already-active tab (a no-op), yet Strategy 0b still
+            //     reports success and returns early, which SKIPS the coordinate-based
+            //     Strategy 3 fallback below that might otherwise have closed it.
+            //     Excluding it here means collect() returns zero candidates instead,
+            //     reward_result is falsy, and control correctly falls through.
+            const dialogAnchorExclude = new Set(NON_CLOSE_TEXTS);
 
             let dialog = null;
             function findDialog(node) {
@@ -1830,7 +1906,8 @@ async def maybe_clear_lobby_popup(page) -> bool:
                 const label = node.getComponent &&
                     (node.getComponent('cc.Label') || node.getComponent(cc.Label));
                 if (label && typeof label.string === 'string' &&
-                        REWARD_HINTS.some(h => label.string.includes(h))) {
+                        REWARD_HINTS.some(h => label.string.includes(h)) &&
+                        !dialogAnchorExclude.has(label.string.trim())) {
                     let d = node;
                     for (let i = 0; i < 6 && d.parent && d.parent !== scene; i++) d = d.parent;
                     dialog = d; return;
@@ -1840,13 +1917,22 @@ async def maybe_clear_lobby_popup(page) -> bool:
             findDialog(scene);
             if (!dialog) return null;
 
-            function hasPurchaseLabel(node) {
+            function hasExcludedLabel(node) {
                 const lab = node.getComponent &&
                     (node.getComponent('cc.Label') || node.getComponent(cc.Label));
                 if (lab && typeof lab.string === 'string' &&
-                        PURCHASE_TEXTS.some(t => lab.string.includes(t))) return true;
-                for (const c of (node.children || [])) if (hasPurchaseLabel(c)) return true;
+                        (PURCHASE_TEXTS.some(t => lab.string.includes(t)) ||
+                         NON_CLOSE_TEXTS.some(t => lab.string.includes(t)))) return true;
+                for (const c of (node.children || [])) if (hasExcludedLabel(c)) return true;
                 return false;
+            }
+            function ownLabelText(node) {
+                // Direct (non-recursive) label text on this exact node, if any --
+                // used to prefer icon-only buttons (real close X's are almost never
+                // wrapped around a text label of their own; tabs/table buttons are).
+                const lab = node.getComponent &&
+                    (node.getComponent('cc.Label') || node.getComponent(cc.Label));
+                return (lab && typeof lab.string === 'string') ? lab.string.trim() : '';
             }
             const btns = [];
             function collect(node) {
@@ -1854,17 +1940,20 @@ async def maybe_clear_lobby_popup(page) -> bool:
                 const btn = node.getComponent &&
                     (node.getComponent('cc.Button') || node.getComponent(cc.Button));
                 if (btn && Array.isArray(btn.clickEvents) && btn.clickEvents.length > 0
-                        && !hasPurchaseLabel(node)) {
+                        && !hasExcludedLabel(node)) {
                     let wp = null;
                     try { wp = node.convertToWorldSpaceAR(cc.v2(0, 0)); } catch (e) {}
-                    if (wp) btns.push({ node, x: wp.x, y: wp.y, btn });
+                    if (wp) btns.push({ node, x: wp.x, y: wp.y, btn, hasOwnLabel: !!ownLabelText(node) });
                 }
                 for (const c of (node.children || [])) collect(c);
             }
             collect(dialog);
             if (!btns.length) return null;
-            // Cocos y is up → top-right = max y, then max x.
-            btns.sort((a, b) => (b.y - a.y) || (b.x - a.x));
+            // Prefer labelless (icon-only) buttons first -- real X close buttons
+            // rarely carry their own text label, unlike tabs/content buttons that
+            // slipped past the name-based exclusion above. Within each group,
+            // Cocos y is up -> top-right = max y, then max x.
+            btns.sort((a, b) => (a.hasOwnLabel - b.hasOwnLabel) || (b.y - a.y) || (b.x - a.x));
             for (const eh of btns[0].btn.clickEvents) {
                 try { cc.Component.EventHandler.emitEvents([eh], { type: 'click' }); } catch (e) {}
             }
@@ -1876,6 +1965,40 @@ async def maybe_clear_lobby_popup(page) -> bool:
             cleared = True
     except Exception:
         pass
+
+    # 2026-07-07: safe_click_design_position/emitEvents report success as soon
+    # as the click CALL executes -- neither knows whether it actually landed
+    # on the real close button vs. a neighboring tab/table button at nearly
+    # the same position. That gap let this exact dialog report cleared=True
+    # while still open, causing a SECOND live stuck-bounce incident even after
+    # the tab/title anchor-collision bug (below) was fixed. VERIFY the title
+    # is actually gone before trusting either click; if not, keep going
+    # instead of returning a false positive that skips every later strategy.
+    if cleared and promo_before and await _label_containing(page, "儲值神幣大放送"):
+        cleared = False
+    elif cleared:
+        return cleared
+
+    # --- Strategy 0c: coordinate fallback for 儲值神幣大放送 specifically ---
+    # This exact dialog has caused THREE separate stuck bounce loops
+    # (2026-07-05, 2026-07-06, 2026-07-07) -- the generic Strategy 3 coordinate
+    # fallback further below is calibrated for a different modal style and
+    # doesn't land on this dialog's X either. Gated on promo_before (computed
+    # once, above) so a coordinate miss elsewhere can never cause a stray
+    # click in an unrelated scene.
+    if promo_before:
+        try:
+            promo_result = await safe_click_design_position(
+                page,
+                DEFAULT_STORAGE_PROMO_CLOSE_X,
+                DEFAULT_STORAGE_PROMO_CLOSE_Y,
+                attempts=1,
+                wait_ms=600,
+            )
+            if promo_result is not None and not await _label_containing(page, "儲值神幣大放送"):
+                cleared = True
+        except Exception:
+            pass
 
     if cleared:
         return cleared
@@ -1961,6 +2084,35 @@ async def maybe_clear_lobby_popup(page) -> bool:
         wait_ms=800,
     )
     cleared = cleared or (modal_close_result is not None)
+    if cleared:
+        return cleared
+
+    # --- Strategy 4: Escape key + click-outside-modal, layout-independent ---
+    # 2026-07-08: 儲值神幣大放送 caused a FOURTH stuck bounce loop, this time with
+    # a different tab lineup (an extra "玩牌守衛戰" tab) -- Strategy 0c's fixed
+    # coordinate for this dialog's X apparently isn't reliable across every
+    # layout variant. Rather than chase yet another precise coordinate, try two
+    # layout-independent dismissal methods that don't depend on exactly where
+    # the X renders: (a) Escape key (works if the game listens for it -- not
+    # guaranteed for a Cocos canvas app, but harmless to try), (b) click in the
+    # dimmed background clearly OUTSIDE the modal's bounds (many modal
+    # implementations close on outside-click; the modal's own bounds have been
+    # consistent across all observed variants even when its internal tabs
+    # differ, so a far-corner click should reliably miss its content either way).
+    if await _label_containing(page, "儲值神幣大放送"):
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
+        if not await _label_containing(page, "儲值神幣大放送"):
+            return True
+        try:
+            await safe_click_design_position(page, 30.0, 30.0, attempts=1, wait_ms=500)
+        except Exception:
+            pass
+        if not await _label_containing(page, "儲值神幣大放送"):
+            return True
 
     return cleared
 
@@ -2402,11 +2554,77 @@ async def run_autoplay_random(settings: Settings, timeout_seconds: int, record_v
             print(f"Saved autoplay video to: {video_path}")
 
 
+# Every env knob cardaware_wrapper.py reads to decide HOW to play. Checkpoints
+# alone do NOT identify a run: the de-anchor experiment shares its policy/belief/
+# value with the plain ISMCTS baseline and differs only in ISMCTS_ROOT_NOISE /
+# ISMCTS_MIN_VISITS, so without the flags the two are indistinguishable.
+_PROVENANCE_ENV = (
+    "CARDAWARE_CKPT", "BELIEF_CKPT", "VALUE_CKPT", "CARDAWARE_DIR",
+    "CARDAWARE_SEARCH", "CARDAWARE_WORLDS", "CARDAWARE_TOPM", "CARDAWARE_BUDGET",
+    "BELIEF_SEARCH", "VALUE_LEAF", "POSTACTION_VALUE",
+    "ISMCTS", "ISMCTS_CPUCT", "ISMCTS_SIMS",
+    "ISMCTS_ROOT_NOISE", "ISMCTS_NOISE_EPS", "ISMCTS_NOISE_ALPHA", "ISMCTS_MIN_VISITS",
+)
+
+
+def _agent_provenance() -> dict:
+    """Identity of the agent producing this run.
+
+    RUN_TAG only gets set when a run goes through run_online_leg.py --tag. 6189 of
+    the first 7608 online games carried no tag and had to be recovered by parsing
+    campaign logs, so the tag is derived when absent and the full knob snapshot is
+    recorded either way — attribution must never depend on remembering a flag.
+    """
+    env = {}
+    for key in _PROVENANCE_ENV:
+        value = os.environ.get(key, "")
+        if value:
+            env[key] = value
+    ckpt = {
+        "policy": os.path.basename(os.environ.get("CARDAWARE_CKPT", "")),
+        "belief": os.path.basename(os.environ.get("BELIEF_CKPT", "")),
+        "value": os.path.basename(os.environ.get("VALUE_CKPT", "")),
+    }
+    tag = os.environ.get("RUN_TAG", "").strip()
+    if not tag:
+        # Coarse on purpose — run_dir + env below are the exact identity; this
+        # just guarantees no row is ever left with an empty grouping key.
+        tag = "auto:" + (os.path.splitext(ckpt["policy"])[0] or "default")
+    return {"run_tag": tag, "ckpt": ckpt, "env": env}
+
+
 async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_video: bool = False, executor: str = "gui", games_to_play: int = 1) -> None:
     lock_path = settings.lock_dir / "autoplay_agent.lock"
     with SingleInstanceGuard(lock_path):
-        output_dir = settings.artifact_dir / datetime.now().strftime("%Y%m%d-%H%M%S") / "autoplay_agent"
+        run_dir = settings.artifact_dir / datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = run_dir / "autoplay_agent"
         output_dir.mkdir(parents=True, exist_ok=True)
+        provenance = _agent_provenance()
+        # Run-scoped monotonic game key. observation.game_index is derived by
+        # replaying the WS packet buffer, so it RESETS to 1 whenever the socket
+        # reconnects mid-run: two distinct games then share an index, and any
+        # analysis keyed on it silently merges them (45 of 272 past run dirs hit
+        # exactly this, corrupting both the reward join and the per-game flags).
+        # game_uid never resets and is stamped on BOTH action_log and reward_log,
+        # so the two logs join on an exact shared key rather than on "the nearest
+        # preceding source_seq", which was only ever a heuristic.
+        game_uid = 1
+        # Manifest so this run's games can be attributed to the exact agent config
+        # later. parse_online_games keys games by this run dir, so dropping the
+        # tag + checkpoints here makes online_games.jsonl attributable too.
+        try:
+            (run_dir / "run_manifest.json").write_text(json.dumps({
+                "run_tag": provenance["run_tag"],
+                "started": datetime.now().isoformat(timespec="seconds"),
+                "ckpt": {
+                    "policy": os.environ.get("CARDAWARE_CKPT", ""),
+                    "belief": os.environ.get("BELIEF_CKPT", ""),
+                    "value": os.environ.get("VALUE_CKPT", ""),
+                },
+                "env": provenance["env"],
+            }, indent=2), encoding="utf-8")
+        except Exception:
+            pass  # provenance is nice-to-have; never block a run over it
         video_dir = output_dir / "video" if record_video else None
         os.environ["BIG2_AGENT_DEBUG_DIR"] = str(output_dir.resolve())
         agent = build_decision_agent()
@@ -2432,6 +2650,37 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
 
             loop = asyncio.get_running_loop()
             hard_deadline = loop.time() + timeout_seconds
+
+            # Graceful stop: `kill <pid>` sends SIGTERM by default, which used to
+            # terminate the process immediately -- skipping the save_network_log()
+            # call after the main loop, so every game played in that run was lost
+            # to the training corpus (parse_online_games.py reads network_log.json,
+            # which is only written there). Catching SIGTERM/SIGINT here just flips
+            # a flag the main while-loop condition checks below, so a requested stop
+            # exits through the SAME normal path as reaching games_to_play or the
+            # timeout deadline -- network log and derived artifacts still get saved.
+            stop_requested = False
+            _stop_signal_count = 0
+
+            def _handle_stop_signal(sig_name: str) -> None:
+                nonlocal stop_requested, _stop_signal_count
+                _stop_signal_count += 1
+                if _stop_signal_count == 1:
+                    logger.log(
+                        f"Received {sig_name} -- finishing current step, then saving "
+                        "network log before exit (send again to force-kill immediately)"
+                    )
+                    stop_requested = True
+                else:
+                    logger.log(f"Received {sig_name} again -- force-killing without saving")
+                    os._exit(1)
+
+            try:
+                loop.add_signal_handler(signal.SIGTERM, _handle_stop_signal, "SIGTERM")
+                loop.add_signal_handler(signal.SIGINT, _handle_stop_signal, "SIGINT")
+            except (NotImplementedError, RuntimeError):
+                pass  # signal handlers unsupported on this platform/loop; kill still works, just not gracefully
+
             games_played = 0            # complete sessions (lobby returns); stop at games_to_play
             game_number = 0             # individual games (局) finished within current session
             was_in_game_scene = False
@@ -2505,7 +2754,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 )
                 return True
 
-            while loop.time() < hard_deadline:
+            while loop.time() < hard_deadline and not stop_requested:
                 page = resolve_active_page(page)
                 scene = await classify_page_stage(page)
                 # Only attempt popup-clear when we are not in the game canvas
@@ -2663,6 +2912,16 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                                     "self_remaining": _rs["self"]["remaining"],
                                     "scores": {a: v["score"] for a, v in _rs.items()},
                                     "remaining": {a: v["remaining"] for a, v in _rs.items()},
+                                    # Self-describing provenance: which agent config produced this
+                                    # game. Attributing games to models by timestamp window was
+                                    # error-prone (launch boundaries interleave in the chain log);
+                                    # these fields make each row stand on its own. run_dir is the
+                                    # exact key into that run's manifest, so no analysis ever has to
+                                    # infer a run boundary from timestamps again.
+                                    "game_uid": game_uid,
+                                    "run_dir": run_dir.name,
+                                    "run_tag": provenance["run_tag"],
+                                    "ckpt": provenance["ckpt"],
                                 }
                                 with reward_log_path.open("a", encoding="utf-8") as _rf:
                                     _rf.write(json.dumps(_reward_rec, ensure_ascii=False) + "\n")
@@ -2677,6 +2936,11 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                         f"(placement={_placement}, my_remaining={_my_remaining}, "
                         f"enemies={_enemy_remaining})"
                     )
+                    # This game is finished and its reward row is written, so roll
+                    # the key. Bumping it here (game lifecycle) rather than on a
+                    # game_index change keeps the uid correct even for a game the
+                    # agent was never asked to act in.
+                    game_uid += 1
                     await page.wait_for_timeout(3000)
                     continue
 
@@ -2709,7 +2973,16 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                     # executor record. Flag it loudly, then resync.
                     _cur_hc = state.get("my_hand_count")
                     if isinstance(_cur_hc, int):
-                        if (_last_acted_hand is not None and _cur_hc < _last_acted_hand
+                        # Only a genuine MID-GAME shrink counts: require an active
+                        # game (game_has_started) and a still-nonzero hand. Without
+                        # these, a game/lobby boundary — where _last_acted_hand holds
+                        # the PREVIOUS game's count and the fresh scene momentarily
+                        # reads 0 — fired a false "N->0" (96% of past detections).
+                        # A real last-card auto-play (->0) is a forced, optimal move
+                        # captured by reward_log, so it needn't be flagged here.
+                        if (game_has_started and _cur_hc > 0
+                                and _last_acted_hand is not None
+                                and _cur_hc < _last_acted_hand
                                 and not in_scoring_wait):
                             logger.log(
                                 f"⚠️ AUTO-PLAY DETECTED: our hand {_last_acted_hand}->{_cur_hc} "
@@ -2852,6 +3125,7 @@ async def run_autoplay_agent(settings: Settings, timeout_seconds: int, record_vi
                 action_log.append(
                     {
                         "step": "agent_decision",
+                        "game_uid": game_uid,
                         "observation": observation.model_dump(),
                         "decision": decision.model_dump(),
                         "result": result,
@@ -2983,8 +3257,23 @@ async def run_lobby_wait(settings: Settings) -> None:
         print(f"Scene tree saved: {scene_tree_path}")
 
 
+def _chrome_is_running() -> bool:
+    """Best-effort check for an already-running Chrome instance (macOS).
+    2026-07-05: every autoplay-agent launch called webbrowser.open() unconditionally,
+    including on failed attempts (e.g. the SingleInstanceGuard lock rejecting a
+    launch) -- an overnight spin-loop bug opened ~2000 dashboard tabs in the same
+    Chrome window as a result. If Chrome is already up, skip opening another tab;
+    the user can navigate to the dashboard URL themselves if they need it."""
+    try:
+        return subprocess.run(
+            ["pgrep", "-x", "Google Chrome"], capture_output=True, timeout=2
+        ).returncode == 0
+    except Exception:
+        return False  # unknown platform / pgrep unavailable -- fall back to opening
+
+
 def _launch_dashboard_window() -> None:
-    """啟動 HTML 看板伺服器（背景）並開啟瀏覽器。"""
+    """啟動 HTML 看板伺服器（背景），Chrome 沒開才自動開分頁。"""
     import atexit, socket, time, webbrowser
 
     project_dir = Path(__file__).resolve().parent.parent.parent
@@ -2996,12 +3285,17 @@ def _launch_dashboard_window() -> None:
         print(f"[dashboard] 找不到 {dashboard}，略過")
         return
 
-    # 若同 port 已有伺服器，直接開瀏覽器即可
+    chrome_running = _chrome_is_running()
+
+    # 若同 port 已有伺服器，只有 Chrome 還沒開時才開瀏覽器
     try:
         s = socket.create_connection(("localhost", port), timeout=0.3)
         s.close()
-        webbrowser.open(url)
-        print(f"[dashboard] 看板已開啟：{url}")
+        if chrome_running:
+            print(f"[dashboard] 看板已在跑，Chrome 已開啟，略過自動開分頁：{url}")
+        else:
+            webbrowser.open(url)
+            print(f"[dashboard] 看板已開啟：{url}")
         return
     except OSError:
         pass
@@ -3024,7 +3318,10 @@ def _launch_dashboard_window() -> None:
         except OSError:
             time.sleep(0.1)
 
-    webbrowser.open(url)
+    if chrome_running:
+        print(f"[dashboard] 看板伺服器已啟動，Chrome 已開啟，略過自動開分頁：{url}")
+    else:
+        webbrowser.open(url)
     print(f"[dashboard] 看板已開啟：{url}  (PID {proc.pid})")
 
 
