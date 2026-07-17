@@ -33,6 +33,22 @@ def session_start_ts(sess_dir):
     return f"{d[:4]}-{d[4:6]}-{d[6:8]}T{t[:2]}:{t[2:4]}"
 
 
+def next_session_start_ts(sess_dir):
+    """Start ts of the run dir that immediately follows sess_dir — the UPPER bound
+    for this session's window. Without it, reward_log_stats swept in every LATER
+    session's games (a 57x overcount when analyzing an older run), silently
+    mislabelling a multi-version blend as this session's authoritative reward."""
+    dirs = sorted(glob.glob(os.path.join(ART, "*", "autoplay_agent")))
+    # match by run-dir name so a relative CLI arg still lines up with glob's abspaths
+    names = [os.path.basename(os.path.dirname(d)) for d in dirs]
+    want = os.path.basename(os.path.dirname(sess_dir))
+    try:
+        i = names.index(want)
+    except ValueError:
+        return None
+    return session_start_ts(dirs[i + 1]) if i + 1 < len(dirs) else None
+
+
 def exec_health(run_log):
     txt = open(run_log).read() if os.path.exists(run_log) else ""
     notes = re.findall(r"ML: ([a-z_]+)", txt)
@@ -74,13 +90,15 @@ def reward_stats(timeline_json):
     }
 
 
-def results_stats(start_ts):
+def results_stats(start_ts, end_ts=None):
     path = os.path.join(ART, "game_results.jsonl")
     if not os.path.exists(path):
         return None
     rows = [json.loads(l) for l in open(path) if l.strip()]
     if start_ts:
         rows = [r for r in rows if r.get("timestamp", "") >= start_ts]
+    if end_ts:
+        rows = [r for r in rows if r.get("timestamp", "") < end_ts]
     if not rows:
         return None
     from collections import Counter
@@ -97,14 +115,18 @@ def results_stats(start_ts):
     }
 
 
-def reward_log_stats(start_ts):
-    """Authoritative per-game reward from reward_log.jsonl (server scores)."""
+def reward_log_stats(start_ts, end_ts=None):
+    """Authoritative per-game reward from reward_log.jsonl (server scores),
+    scoped to [start_ts, end_ts). end_ts is the next session's start; without it
+    this swept in every later version's games."""
     path = os.path.join(ART, "reward_log.jsonl")
     if not os.path.exists(path):
         return None
     rows = [json.loads(l) for l in open(path) if l.strip()]
     if start_ts:
         rows = [r for r in rows if r.get("timestamp", "") >= start_ts]
+    if end_ts:
+        rows = [r for r in rows if r.get("timestamp", "") < end_ts]
     s = sorted(r["self_score"] for r in rows if r.get("self_score") is not None)
     if not s:
         return None
@@ -124,6 +146,7 @@ def main():
         print("no session found"); return
     print(f"session: {sess}")
     start = session_start_ts(sess)
+    end = next_session_start_ts(sess)
     print(f"session start ts filter: {start}\n")
 
     print("=== 執行健康度 ===")
@@ -131,7 +154,7 @@ def main():
         print(f"  {k}: {v}")
 
     print("\n=== Reward (reward_log.jsonl, server 分數, 權威完整) ===")
-    rl = reward_log_stats(start)
+    rl = reward_log_stats(start, end)
     if rl:
         print(f"  場數: {rl['n']}  出完: {rl['go_out']}")
         print(f"  avg={rl['avg']:+.2f}  median={rl['median']:+.1f}  "
@@ -153,7 +176,7 @@ def main():
         print("  (timeline 無分數)")
 
     print("\n=== 全部 100 場 (game_results.jsonl, reward 代理指標) ===")
-    gr = results_stats(start)
+    gr = results_stats(start, end)
     if gr:
         print(f"  場數: {gr['n_games']}")
         print(f"  出完牌率 (=賺分率): {gr['go_out_rate']:.1%} ({gr['go_out_count']}/{gr['n_games']})")
