@@ -10,3 +10,9 @@ data/live_training_corpus.jsonl
 
 # --- Claude Code local settings ---
 .claude/
+
+# --- campaign logs / run outputs (regenerated every run) ---
+logs/
+logs_*.txt
+*.log
+scale_cell_bounds.jsonl
