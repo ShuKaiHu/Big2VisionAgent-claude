@@ -14,8 +14,8 @@
 # p2500_v2500 read n=2). These explicit start/end stamps make attribution exact.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 BOUNDS="$HERE/scale_cell_bounds.jsonl"
 cd "$HERE"
 

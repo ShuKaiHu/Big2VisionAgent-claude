@@ -4,8 +4,8 @@
 # under the fixed rule, 100 real games. One 神來也 account => must be sequential.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 cd "$HERE"
 WAIT_PID="${1:-}"
 

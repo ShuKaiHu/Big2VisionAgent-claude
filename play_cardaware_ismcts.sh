@@ -10,7 +10,7 @@
 #   ./play_cardaware_ismcts.sh 50
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 GAMES="${1:-30}"
 
 export BIG2_AGENT_COMMAND="$HERE/cardaware_wrapper.py"

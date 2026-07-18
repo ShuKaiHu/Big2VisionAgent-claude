@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_online_leg import count_since, run_leg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PPO = "/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo/ppo/checkpoints/saved"
+PPO = "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/ppo/checkpoints/saved"
 GOAL = 100
 
 ADOPT_PID = 84663

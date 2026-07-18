@@ -5,8 +5,8 @@
 # (ready), while value_1500/2500 finish training in the background.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 cd "$HERE"
 
 run_cell () {

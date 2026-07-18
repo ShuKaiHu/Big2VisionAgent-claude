@@ -9,7 +9,7 @@
 # 模型:saved/ 下純檔名 或 絕對路徑。版本標籤會記進每局 seats(我方座位)。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 MODEL="${1:?usage: ./play_and_parse.sh <model> <version-label> [search] [games]}"
 LABEL="${2:?need a version label, e.g. V4}"
 SEARCH="${3:-0}"

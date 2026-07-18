@@ -11,7 +11,7 @@
 # 模型檔接受:絕對路徑 / AlphaBig2-ppo/ppo/checkpoints 下的純檔名。
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 CKPT_DIR="$PPO/ppo/checkpoints"
 MODEL="${1:-ppo_cardaware_best.pt}"
 GAMES="${2:-30}"

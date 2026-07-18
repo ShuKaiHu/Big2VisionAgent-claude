@@ -39,7 +39,7 @@
 #   no-choice games, (run_dir, game_uid) join failures.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 cd "$HERE"
 
 CTRL="$PPO/ppo/checkpoints/policy_4500_best.pt"

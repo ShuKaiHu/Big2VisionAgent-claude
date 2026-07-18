@@ -5,7 +5,7 @@
 # /AlphaBig2-ppo -> /AlphaBig2-claude symlink left by the repo consolidation.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"   # symlink to AlphaBig2-claude
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"   # symlink to AlphaBig2-claude
 cd "$HERE"
 
 CTRL="$PPO/ppo/checkpoints/policy_4500_best.pt"

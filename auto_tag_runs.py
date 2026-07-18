@@ -22,7 +22,7 @@ import time
 
 VISION_DIR = "/Users/shukaihu/Code_Project_Local/Big2VisionAgent-claude"
 ART = f"{VISION_DIR}/artifacts"
-VERSIONS_PATH = "/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo/ppo/data/run_versions.json"
+VERSIONS_PATH = "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/ppo/data/run_versions.json"
 LOG_PATH = f"{VISION_DIR}/auto_tag_runs.log"
 
 # manually-known runs from before this script existed

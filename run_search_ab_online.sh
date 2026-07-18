@@ -52,8 +52,8 @@
 # GATE: run validate_run_provenance.py on the first leg BEFORE trusting any of this.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 cd "$HERE"
 
 POLICY="$PPO/ppo/checkpoints/policy_4500_best.pt"

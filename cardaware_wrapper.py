@@ -1,4 +1,4 @@
-#!/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo/.venv/bin/python
+#!/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/.venv/bin/python
 """cardaware_wrapper.py — Big2VisionAgent decision agent backed by the cardaware PPO model.
 
 Drop-in replacement for alpha_big2_wrapper.py. Reads an AgentObservation JSON
@@ -35,7 +35,7 @@ import alpha_big2_wrapper as abw
 # already at sys.path[0] (inserted by abw), so `engine`/`enumerateOptions`/
 # `gameLogic` keep resolving to claude's copies — which are byte-identical to
 # ppo's — while `ppo.*` resolves here.
-_AB2PPO = os.environ.get("CARDAWARE_DIR", "/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo")
+_AB2PPO = os.environ.get("CARDAWARE_DIR", "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude")
 if _AB2PPO not in sys.path:
     sys.path.append(_AB2PPO)
 
@@ -86,7 +86,7 @@ _VALUE_LEAF = os.environ.get("VALUE_LEAF") == "1"
 # min-plays earns the whole +8.5% MSE; dominance was ~redundant for position value.
 # extra_dim is auto-detected from the checkpoint, so plain VALUE.pt still loads.
 _VALUE_CKPT = os.environ.get(
-    "VALUE_CKPT", "/Users/shukaihu/Code_Project_Local/AlphaBig2-Value/checkpoints/VALUE_minplays.pt")
+    "VALUE_CKPT", "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value/checkpoints/VALUE_minplays.pt")
 
 # ISMCTS=1 → true single-tree information-set MCTS (vs the flat PIMC _search_action).
 # One tree keyed by OUR action-path; each simulation re-determinizes a world from

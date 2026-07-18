@@ -5,8 +5,8 @@
 #   2. V4PBV_base_v2        — the un-iterated base baseline (secondary)
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 cd "$HERE"
 WAIT_PID="${1:-}"
 

@@ -23,8 +23,8 @@ BURST_GAMES = 25
 DEADLINE_HOURS = 11.0  # hard stop for the collection phase regardless of progress
 
 VISION_DIR = "/Users/shukaihu/Code_Project_Local/Big2VisionAgent-claude"
-PPO_DIR = "/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VALUE_DIR = "/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO_DIR = "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VALUE_DIR = "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 CORPUS = f"{PPO_DIR}/ppo/data/online_games.jsonl"
 PPO_VENV_PY = f"{PPO_DIR}/.venv/bin/python3"
 LOG_PATH = f"{VISION_DIR}/overnight_campaign.log"

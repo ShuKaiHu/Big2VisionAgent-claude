@@ -31,7 +31,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULTS = os.path.join(HERE, "artifacts", "game_results.jsonl")
-PPO_DIR = "/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
+PPO_DIR = "/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 STUCK_BOUNCE_LIMIT = 6  # consecutive lobby bounces w/o a completed game -> treat as stuck
 
 

@@ -4,8 +4,8 @@
 # One 神來也 account => sequential legs. Each leg = 100 real games via run_online_leg.py.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
-VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-Value"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
+VAL="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude/value"
 cd "$HERE"
 
 # ── Leg 1: V5 = PPO_V4 policy + flat PIMC search (worlds=24, budget 1s) ──

@@ -8,7 +8,7 @@
 # 可調:CARDAWARE_BUDGET(秒/手)、CARDAWARE_TOPM(候選動作數)、CARDAWARE_WORLDS(上限)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-ppo"
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 GAMES="${1:-15}"
 
 export BIG2_AGENT_COMMAND="$HERE/cardaware_wrapper.py"
