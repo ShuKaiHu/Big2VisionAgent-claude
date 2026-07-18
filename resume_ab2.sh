@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Resume the AB2 3-arm campaign from wherever each arm stands (pause-safe).
 # Reads live counts from reward_log and tops arms up round-by-round (50-game legs,
-# interleaved C,L,B) to 300 each. Checkpoint paths resolve through the
-# /AlphaBig2-ppo -> /AlphaBig2-claude symlink left by the repo consolidation.
+# interleaved C,L,B) to 300 each. Checkpoints live in the consolidated repo.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"   # symlink to AlphaBig2-claude
+PPO="/Users/shukaihu/Code_Project_Local/AlphaBig2-claude"
 cd "$HERE"
 
 CTRL="$PPO/ppo/checkpoints/policy_4500_best.pt"
